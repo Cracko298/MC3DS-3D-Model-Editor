@@ -1,46 +1,81 @@
-import sys, shutil, os, random, string, json, re, time, zipfile, io, base64, struct, subprocess, importlib
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from __future__ import annotations
+
+import base64
+import copy
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
 import tkinter as tk
-VERSION = 0.7
-yxFloatValue = 0.3
-zoom_factor = 0
-inZoomFactor = 0.9
-outZoomFactor = 1.1
-azimuth = 30
-elevation = 30
-global_preview_rotation = True
-increaseEandA = 5
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+APP_TITLE = "MC3DS Model Editor"
+APP_VERSION = "1.0"
+TEXT_FORMAT_HINT = "Name\\nX, Y, Z\\nW, H, D\\n"
+
+
+def _install_requirements() -> None:
+    req = Path(__file__).with_name("requirements.txt")
+    if not req.exists():
+        raise FileNotFoundError("requirements.txt was not found next to main.py")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", str(req)])
+
 
 try:
-    import stl, requests, lxml, lxml.etree
     import numpy as np
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    from modules.bjson import BJSONFile
-    from pygltflib import GLTF2, Scene, Node, Mesh, Primitive, Buffer, BufferView, Accessor, Asset
-
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 except ImportError:
-    answ = messagebox.askyesno("Notice", "The script needs to install some dependancies in order to run correctly.\nMay it install dependancies from 'requirements.txt'?")
-    if answ:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-        messagebox.showinfo("Notice","The script has installed some python Modules.\nIt will now restart.")
-        time.sleep(1)
-        os.system(f'python "{__file__}"')
-        sys.exit(1)
+    root = tk.Tk()
+    root.withdraw()
+    answer = messagebox.askyesno(
+        APP_TITLE,
+        "Some required Python packages are missing.\n\n"
+        "Would you like this tool to install them from requirements.txt now?",
+    )
+    root.destroy()
+    if answer:
+        _install_requirements()
+        os.execv(sys.executable, [sys.executable, __file__])
+    raise
 
-class Object3D:
-    def __init__(self, name, position, dimensions):
-        self.name = name
-        self.position = np.array(position)
-        self.dimensions = np.array(dimensions)
-        self.selected = False
-        self.texture = None
-        self.texture_coords = None
+try:
+    import stl
+except Exception:
+    stl = None
 
-    def get_corners(self):
-        x, y, z = self.position
-        dx, dy, dz = self.dimensions
+try:
+    from pygltflib import Accessor, Buffer, BufferView, GLTF2, Mesh, Node, Primitive, Scene
+except Exception:
+    GLTF2 = None
+
+try:
+    from modules.bjson import BJSONFile
+except Exception:
+    BJSONFile = None
+
+
+@dataclass
+class Cuboid:
+    geometry_key: str
+    bone_name: str
+    cube_index: int
+    name: str
+    origin: np.ndarray
+    size: np.ndarray
+    selected: bool = False
+    uuid: str = ""
+
+    def corners(self) -> list[list[float]]:
+        x, y, z = self.origin.tolist()
+        dx, dy, dz = self.size.tolist()
         return [
             [x, y, z],
             [x + dx, y, z],
@@ -51,1710 +86,1307 @@ class Object3D:
             [x + dx, y + dy, z + dz],
             [x, y + dy, z + dz],
         ]
-    
-    def scale(self, scale_factor):
-        self.dimensions *= scale_factor
 
-    def reset_scale(self):
-        self.dimensions = self.original_dimensions
-
-def map_texture():
-    global objects, canvas
-    
-    selected_name = object_selector.get()
-    if not selected_name:
-        messagebox.showerror("No Selection", "Please select an object to map the texture onto.")
-        return
-    
-    file_path = filedialog.askopenfilename(
-        filetypes=[("PNG Image", "*.png")],
-        title="Select Texture"
-    )
-    if not file_path:
-        return
-
-    try:
-        # Load the texture image and normalize it
-        texture_img = plt.imread(file_path)
-        if texture_img.dtype == np.uint8:
-            texture_img = texture_img.astype(np.float32) / 255.0
-
-        for obj in objects:
-            if obj.name == selected_name:
-                obj.texture = texture_img
-                # Create texture coordinates for each face
-                obj.texture_coords = {
-                    'front': [(0, 0), (1, 0), (1, 1), (0, 1)],
-                    'back': [(0, 0), (1, 0), (1, 1), (0, 1)],
-                    'top': [(0, 0), (1, 0), (1, 1), (0, 1)],
-                    'bottom': [(0, 0), (1, 0), (1, 1), (0, 1)],
-                    'left': [(0, 0), (1, 0), (1, 1), (0, 1)],
-                    'right': [(0, 0), (1, 0), (1, 1), (0, 1)]
-                }
-                break
-
-        # Update the display
-        draw_3d_plot(objects, canvas)
-        
-    except Exception as e:
-        messagebox.showerror("Texture Error", f"Failed to load texture: {str(e)}")
-
-def draw_3d_plot(objects, canvas):
-    global azimuth, elevation
-    ax.clear()
-    ax.set_facecolor('darkgray')
-    ax.view_init(elevation, azimuth)
-    selected_color = 'darkcyan'
-    default_color = 'cyan'
-    b_Val = 0.15
-    tColors = 'black'
-    tColorSelected = 'red'
-    selectedaVal = 0.30
-    light_red = (1, 0.5, 0.5, 0.8)
-
-    for obj in objects:
-        corners = obj.get_corners()
-        verts = [
-            [corners[0], corners[1], corners[5], corners[4]],
-            [corners[7], corners[6], corners[2], corners[3]],
-            [corners[0], corners[3], corners[7], corners[4]],
-            [corners[1], corners[2], corners[6], corners[5]],
-            [corners[0], corners[1], corners[2], corners[3]],
-            [corners[4], corners[5], corners[6], corners[7]],
-        ]
-        color = selected_color if obj.selected else default_color
-        tColor = tColors if obj.selected else tColorSelected
-        tColor = tColorSelected if obj.selected else tColors
-
-        a_val = selectedaVal if obj.selected else b_Val
-
-        if obj.texture is not None:
-            ax.add_collection3d(Poly3DCollection(verts, facecolors=obj.texture, linewidths=1, edgecolors=light_red, alpha=a_val))
-        else:
-            ax.add_collection3d(Poly3DCollection(verts, facecolors=color, linewidths=1, edgecolors=light_red, alpha=a_val))
-
-        center = obj.position + obj.dimensions / 1.5
-        if obj.selected:
-            ax.text(*center+7, obj.name, color=tColor, fontsize=8, fontweight='bold', bbox=dict(alpha=0.7))
-        else:
-            ax.text(*center, obj.name, color=tColor)
-
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-    all_positions = np.array([obj.position for obj in objects])
-    all_dimensions = np.array([obj.dimensions for obj in objects])
-    min_pos = np.min(all_positions, axis=0)
-    max_pos = np.max(all_positions + all_dimensions, axis=0)
-
-    ax.set_xlim(min_pos[0], max_pos[0])
-    ax.set_ylim(min_pos[1], max_pos[1])
-    ax.set_zlim(min_pos[2], max_pos[2])
-
-    max_range = np.array([max_pos[0] - min_pos[0], max_pos[1] - min_pos[1], max_pos[2] - min_pos[2]])
-    max_range = max(max_range)
-    mid_point = (min_pos + max_pos) / 2
-    ax.set_xlim(mid_point[0] - max_range / 2, mid_point[0] + max_range / 2)
-    ax.set_ylim(mid_point[1] - max_range / 2, mid_point[1] + max_range / 2)
-    ax.set_zlim(mid_point[2] - max_range / 2, mid_point[2] + max_range / 2)
-
-    canvas.draw()
-
-def zoom(event):
-    global ax, canvas, current_model_file, zoom_factor
-
-    if event.delta > 0:
-        zoom_factor = inZoomFactor
-    elif event.delta < 0:
-        zoom_factor = outZoomFactor
-
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    zlim = ax.get_zlim()
-
-    x_center = (xlim[0] + xlim[1]) / 2
-    y_center = (ylim[0] + ylim[1]) / 2
-    z_center = (zlim[0] + zlim[1]) / 2
-
-    x_range = (xlim[1] - xlim[0]) / 2 * zoom_factor
-    y_range = (ylim[1] - ylim[0]) / 2 * zoom_factor
-    z_range = (zlim[1] - zlim[0]) / 2 * zoom_factor
-
-    ax.set_xlim([x_center - x_range, x_center + x_range])
-    ax.set_ylim([y_center - y_range, y_center + y_range])
-    ax.set_zlim([z_center - z_range, z_center + z_range])
-
-    canvas.draw()
-
-
-def on_model_selected(event):
-    global current_model_file, objects, model_selector
-
-    selected_file = model_selector.get()
-    current_model_file = os.path.join(os.getcwd(), 'data', selected_file)
-
-    objects = read_objects_from_file(current_model_file)
-
-    object_selector.config(values=[obj.name for obj in objects])
-    object_selector.set('')
-
-    draw_3d_plot(objects, canvas)
-
-
-def update_object_data():
-    selected_name = object_selector.get()
-    obj = next((o for o in objects if o.name == selected_name), None)
-    if obj:
-        try:
-            new_position = [float(pos_entry_x.get()), float(pos_entry_y.get()), float(pos_entry_z.get())]
-            new_dimensions = [float(dim_entry_x.get()), float(dim_entry_y.get()), float(dim_entry_z.get())]
-
-            obj.position = np.array(new_position)
-            obj.dimensions = np.array(new_dimensions)
-            draw_3d_plot(objects, canvas)
-            save_objects(objects, current_model_file)
-        except ValueError:
-            messagebox.showerror("Invalid input", "Please enter valid Ineger/Floating Point Numbers\nUsage for positions and dimensions.\n\nStrings (Non Numerical Numbers) are not Allowed.")
-            return
-
-def on_object_selected(event):
-    selected_name = object_selector.get()
-    for obj in objects:
-        obj.selected = (obj.name == selected_name)
-
-    draw_3d_plot(objects, canvas)
-
-    obj = next((o for o in objects if o.name == selected_name), None)
-    if obj:
-        pos_entry_x.delete(0, tk.END)
-        pos_entry_x.insert(0, str(obj.position[0]))
-        pos_entry_y.delete(0, tk.END)
-        pos_entry_y.insert(0, str(obj.position[1]))
-        pos_entry_z.delete(0, tk.END)
-        pos_entry_z.insert(0, str(obj.position[2]))
-        dim_entry_x.delete(0, tk.END)
-        dim_entry_x.insert(0, str(obj.dimensions[0]))
-        dim_entry_y.delete(0, tk.END)
-        dim_entry_y.insert(0, str(obj.dimensions[1]))
-        dim_entry_z.delete(0, tk.END)
-        dim_entry_z.insert(0, str(obj.dimensions[2]))
-
-def save_objects(objects, filename="modified_data.txt"):
-    with open(filename, "w") as file:
-        for obj in objects:
-            file.write(f"{obj.name}\n")
-            file.write(f"{', '.join(map(str, obj.position))}\n")
-            file.write(f"{', '.join(map(str, obj.dimensions))}\n\n")
-
-def read_objects_from_file(filename):
-    objects0 = []
-    with open(filename, 'r') as file:
-        lines = file.readlines()
-
-    i = 0
-    while i < len(lines):
-        name = lines[i].strip()
-        position = list(map(float, lines[i + 1].strip().split(',')))
-        dimensions = list(map(float, lines[i + 2].strip().split(',')))
-        objects0.append(Object3D(name, position, dimensions))
-        i += 4
-
-    return objects0
-
-def list_model_files(directory):
-    return [f for f in os.listdir(directory) if f.endswith('.txt') and 'geometry' in f]
-
-def update_model_selector():
-    global current_model_file
-    """Update the model selector dropdown with the latest model files."""
-    global model_selector
-    model_directory = os.path.join(os.getcwd(), 'data')
-    model_files = list_model_files(model_directory)
-
-    if not model_files:
-        model_selector['values'] = []
-        messagebox.showerror("No Models Found", "No .txt model files found in the 'data' directory.")
-        sys.exit()
-    else:
-        model_selector['values'] = model_files
-        model_selector.set(model_files[0] if model_files else "")
-
-    current_model_file = os.path.join(model_directory, model_files[0])
-    draw_3d_plot(objects, canvas)
-
-def open_file():
-    global current_model_file, objects
-
-    file_path = filedialog.askopenfilename(
-        filetypes=[("Text Model Files", "*.txt")],
-        initialdir=os.path.join(os.getcwd(), 'data')
-    )
-    if file_path:
-        current_model_file = file_path
-        objects = read_objects_from_file(current_model_file)
-        object_selector.config(values=[obj.name for obj in objects])
-        object_selector.set('')
-        draw_3d_plot(objects, canvas)
-
-def save_file():
-    global current_model_file, objects
-
-    if not current_model_file:
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text Model Files", "*.txt")],
-            initialdir=os.path.join(os.getcwd(), 'data')
+    def clone(self) -> "Cuboid":
+        return Cuboid(
+            geometry_key=self.geometry_key,
+            bone_name=self.bone_name,
+            cube_index=self.cube_index,
+            name=self.name,
+            origin=self.origin.copy(),
+            size=self.size.copy(),
+            selected=False,
+            uuid=self.uuid,
         )
-        if file_path:
-            current_model_file = file_path
-    if current_model_file:
-        save_objects(objects, current_model_file)
 
-def quit_app():
-    root.quit()
-    sys.exit(1)
 
-def show_tool_options():
-    messagebox.showinfo("Tools", "Tool options not yet implemented.")
+@dataclass
+class ModelDocument:
+    source_type: str = "text"
+    source_path: Optional[Path] = None
+    data: dict[str, Any] | None = None
+    cuboids: list[Cuboid] = field(default_factory=list)
+    dirty: bool = False
+    active_model_key: Optional[str] = None
+    model_keys: list[str] = field(default_factory=list)
 
-def show_app_options():
-    messagebox.showinfo("Options", "Application options not yet implemented.")
+    @staticmethod
+    def _numeric3(values: Any, fallback: tuple[float, float, float]) -> np.ndarray:
+        if not isinstance(values, (list, tuple)) or len(values) != 3:
+            return np.array(fallback, dtype=float)
+        return np.array([float(values[0]), float(values[1]), float(values[2])], dtype=float)
 
-def export_as_obj():
-    global objects
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
+    @classmethod
+    def from_text(cls, path: Path) -> "ModelDocument":
+        with path.open("r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f.readlines()]
 
-    obj_file_path = filedialog.asksaveasfilename(
-        defaultextension=".obj",
-        filetypes=[("OBJ files", "*.obj")],
-        initialdir=os.getcwd(),
-        title="Save OBJ File"
-    )
-
-    if not obj_file_path:
-        return
-
-    try:
-        with open(obj_file_path, 'w') as file:
-            file.write("# Exported OBJ file\n")
-            vertex_count = 1
-
-            for obj in objects:
-                vertices = obj.get_corners()
-                for vertex in vertices:
-                    file.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
-
-                file.write(f"f {vertex_count} {vertex_count+1} {vertex_count+2} {vertex_count+3}\n")
-                file.write(f"f {vertex_count+4} {vertex_count+5} {vertex_count+6} {vertex_count+7}\n")
-                file.write(f"f {vertex_count} {vertex_count+3} {vertex_count+7} {vertex_count+4}\n")
-                file.write(f"f {vertex_count+1} {vertex_count+2} {vertex_count+6} {vertex_count+5}\n")
-                file.write(f"f {vertex_count} {vertex_count+1} {vertex_count+5} {vertex_count+4}\n")
-                file.write(f"f {vertex_count+2} {vertex_count+3} {vertex_count+7} {vertex_count+6}\n")
-
-                vertex_count += 8
-
-        messagebox.showinfo("Export Success", f"Model exported successfully to {obj_file_path}")
-
-    except Exception as e:
-        messagebox.showerror("Export Error", f"Failed to export model: {e}")
-
-def export_as_stl():
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
-
-    stl_file_path = filedialog.asksaveasfilename(
-        defaultextension=".stl",
-        filetypes=[("STL files", "*.stl")],
-        initialdir=os.getcwd(),
-        title="Save STL File"
-    )
-
-    if not stl_file_path:
-        return
-
-    try:
-        faces = []
-
-        for obj in objects:
-            vertices = np.array(obj.get_corners())
-            faces.extend([
-                [vertices[0], vertices[1], vertices[5]],
-                [vertices[5], vertices[4], vertices[0]],
-                [vertices[1], vertices[2], vertices[6]],
-                [vertices[6], vertices[5], vertices[1]],
-                [vertices[2], vertices[3], vertices[7]],
-                [vertices[7], vertices[6], vertices[2]],
-                [vertices[3], vertices[0], vertices[4]],
-                [vertices[4], vertices[7], vertices[3]],
-                [vertices[4], vertices[5], vertices[6]],
-                [vertices[6], vertices[7], vertices[4]],
-                [vertices[0], vertices[1], vertices[2]],
-                [vertices[2], vertices[3], vertices[0]],
-            ])
-
-        faces = np.array(faces)
-        stl_mesh = stl.mesh.Mesh(np.zeros(faces.shape[0], dtype=stl.mesh.Mesh.dtype))
-        for i, face in enumerate(faces):
-            for j in range(3):
-                stl_mesh.vectors[i][j] = face[j]
-        stl_mesh.save(stl_file_path)
-        messagebox.showinfo("Export Success", f"Model exported successfully to {stl_file_path}")
-
-    except Exception as e:
-        messagebox.showerror("Export Error", f"Failed to export model: {e}")
-
-def export_as_text():
-    global current_model_file, objects
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
-    
-    if current_model_file:
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text Model Files", "*.txt")],
-            initialdir=os.getcwd()
-        )
-        if file_path:
-            current_model_file = file_path
-        else:
-            return
-    
-    if current_model_file:
-        save_objects(objects, current_model_file)
-
-    messagebox.showinfo("Export Success", f"Model exported successfully to {current_model_file}")
-
-def openJsonFile():
-    global objects, dim_entry_x, dim_entry_y, dim_entry_z, pos_entry_x, pos_entry_y, pos_entry_z, object_selector
-    if messagebox.askyesno("WARNING", "All Current Model Data and Information in Cache will be lost!\nAre you sure you want to Load a JSON Model File?"):
-        messagebox.showinfo("Resetting Model Data", "All Model Information is being deleted now.\nThis might take a few seconds...")
-        dataFolders = os.listdir(".\\data")
-        for file in dataFolders:
-            os.remove(f".\\data\\{file}")
-        try:
-            os.rmdir('.\\data')
-            os.remove('.\\hash_database.json')
-        except FileNotFoundError:
-            pass
-
-        try:
-            with open('.\\filename.txt','r') as outf:
-                data = outf.readline()
-                os.remove(data.replace("\n",''))
-                getBaseName = os.path.basename(os.path.dirname(data))
-            
-        except FileNotFoundError:
-            pass
-            try:
-                os.rmdir(f"{os.path.dirname(__file__)}\\models\\{getBaseName}")
-                os.rmdir(f"{os.path.dirname(__file__)}\\models")
-            except FileNotFoundError:
-                pass
-        json2modelBase()
-        update_model_selector()
-
-        file_path = os.listdir(".\\data")
-
-        current_model_file = f"{os.path.dirname(__file__)}\\data\\{file_path[0]}"
-        objects = read_objects_from_file(current_model_file)
-        object_selector.config(values=[obj.name for obj in objects])
-        object_selector.set('')
-        draw_3d_plot(objects, canvas)
-
-        with open('.\\hash_database.json','w') as f1:
-            f1.write("JSON File Loaded, DO NOT CONVERT TO BJSON.")
-
-        
-    else:
-        messagebox.showinfo("Data Reset Canceled", "Model Data has not been deleted.\nAll settings untouched.")
-        return
-
-def openBjsonFile():
-    global objects, dim_entry_x, dim_entry_y, dim_entry_z, pos_entry_x, pos_entry_y, pos_entry_z, object_selector
-    if messagebox.askyesno("WARNING", "All Current Model Data and Information in Cache will be lost!\nAre you sure you want to Load another BJSON Model File?"):
-        messagebox.showinfo("Resetting Model Data", "All Model Information is being deleted now.\nThis might take a few seconds...")
-        dataFolders = os.listdir(".\\data")
-        for file in dataFolders:
-            os.remove(f".\\data\\{file}")
-        try:
-            os.rmdir('.\\data')
-            os.remove('.\\hash_database.json')
-        except FileNotFoundError:
-            pass
-
-        try:
-            with open('.\\filename.txt','r') as outf:
-                data = outf.readline()
-                os.remove(data.replace("\n",''))
-                getBaseName = os.path.basename(os.path.dirname(data))
-            
-        except FileNotFoundError:
-            pass
-            try:
-                os.rmdir(f"{os.path.dirname(__file__)}\\models\\{getBaseName}")
-                os.rmdir(f"{os.path.dirname(__file__)}\\models")
-            except FileNotFoundError:
-                pass
-
-        bjson2models()
-        update_model_selector()
-
-        file_path = os.listdir(".\\data")
-
-        current_model_file = f"{os.path.dirname(__file__)}\\data\\{file_path[0]}"
-        objects = read_objects_from_file(current_model_file)
-        object_selector.config(values=[obj.name for obj in objects])
-        object_selector.set('')
-        draw_3d_plot(objects, canvas)
-
-        
-    else:
-        messagebox.showinfo("Data Reset Canceled", "Model Data has not been deleted.\nAll settings untouched.")
-        return
-
-def scale_model(factor):
-    global objects, dim_entry_x, dim_entry_y, dim_entry_z, pos_entry_x, pos_entry_y, pos_entry_z, object_selector
-
-    for obj in objects:
-        original_position = obj.position.copy()
-        
-        obj.scale(factor)
-        if factor == 2:
-            obj.position = [coord / 2 for coord in original_position]
-        elif factor == 0.5:
-            obj.position = [coord * 2 for coord in original_position]
-    
-    draw_3d_plot(objects, canvas)
-
-    selected_name = object_selector.get()
-    if selected_name:
-        obj = next((o for o in objects if o.name == selected_name), None)
-        if obj:
-            dim_entry_x.delete(0, tk.END)
-            dim_entry_x.insert(0, str(obj.dimensions[0]))
-            dim_entry_y.delete(0, tk.END)
-            dim_entry_y.insert(0, str(obj.dimensions[1]))
-            dim_entry_z.delete(0, tk.END)
-            dim_entry_z.insert(0, str(obj.dimensions[2]))
-            
-            pos_entry_x.delete(0, tk.END)
-            pos_entry_x.insert(0, str(obj.position[0]))
-            pos_entry_y.delete(0, tk.END)
-            pos_entry_y.insert(0, str(obj.position[1]))
-            pos_entry_z.delete(0, tk.END)
-            pos_entry_z.insert(0, str(obj.position[2]))
-
-def models2jsonf(answer='--json'):
-    with open(".\\filename.txt",'r') as f0:
-        geoPath = f0.readline()
-        geoPath = geoPath.replace("\n",'')
-
-    with open(geoPath, "r") as f:
-        data = json.load(f)
-
-    directory = ".\\data"
-    text_files0 = [f for f in os.listdir(directory) if f.startswith("geometry.") and f.endswith(".txt")]
-    text_files = []
-    for file0 in text_files0:
-        with open(f"{directory}\\{file0}", 'r') as f0:
-            if len(f0.read()) > 4:
-                text_files.append(file0)
-            else:
-                pass
-
-    def get_base_name_and_number(name):
-        match = re.match(r"(\d*)(\D+)", name)
-        if match:
-            number = int(match.group(1)) if match.group(1) else 0
-            base_name = match.group(2)
-            return base_name, number
-
-    for text_file in text_files:
-        model_name = text_file[len("geometry."):-len(".txt")]
-        if ":" in model_name:
-            model_name.replace("_", ":")
-
-        with open(os.path.join(directory, text_file), "r") as f:
-            lines = f.read().strip().splitlines()
-
-        parsed_data = {}
-        current_name = None
-        for line in lines:
-            line = line.strip()
-
-            if not line:
+        cuboids: list[Cuboid] = []
+        i = 0
+        item_index = 0
+        while i < len(lines):
+            if not lines[i].strip():
+                i += 1
                 continue
+            if i + 2 >= len(lines):
+                raise ValueError("Text model format is incomplete near the end of the file.")
+            name = lines[i].strip()
+            origin = np.array([float(x.strip()) for x in lines[i + 1].split(",")], dtype=float)
+            size = np.array([float(x.strip()) for x in lines[i + 2].split(",")], dtype=float)
+            cuboids.append(
+                Cuboid(
+                    geometry_key="geometry.default",
+                    bone_name="root",
+                    cube_index=item_index,
+                    name=name,
+                    origin=origin,
+                    size=size,
+                    uuid=f"text:{item_index}",
+                )
+            )
+            item_index += 1
+            i += 3
+            if i < len(lines) and not lines[i].strip():
+                i += 1
 
-            if re.match(r"^\w+\d*$", line):
-                current_name = line
-                parsed_data[current_name] = {}
-            elif current_name and "origin" not in parsed_data[current_name]:
-                try:
-                    parsed_data[current_name]["origin"] = list(map(float, line.split(", ")))
-                except ValueError:
-                    print(f"Skipping invalid origin line: {line}")
-            elif current_name:
-                try:
-                    parsed_data[current_name]["size"] = list(map(float, line.split(", ")))
-                except ValueError:
-                    print(f"Skipping invalid size line: {line}")
+        return cls(source_type="text", source_path=path, data=None, cuboids=cuboids, active_model_key="geometry.default", model_keys=["geometry.default"])
 
-        grouped_data = {}
-        for key in parsed_data:
-            base_name, number = get_base_name_and_number(key)
-            if base_name not in grouped_data:
-                grouped_data[base_name] = []
-            grouped_data[base_name].append((number, parsed_data[key]))
+    @classmethod
+    def from_json(cls, path: Path) -> "ModelDocument":
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cuboids, model_keys = cls._extract_cuboids_from_geometry_json(raw)
+        return cls(source_type="json", source_path=path, data=raw, cuboids=cuboids, active_model_key=(model_keys[0] if model_keys else None), model_keys=model_keys)
 
-        for base_name in grouped_data:
-            grouped_data[base_name].sort(key=lambda x: x[0])
+    @classmethod
+    def from_bjson(cls, path: Path) -> "ModelDocument":
+        if BJSONFile is None:
+            raise RuntimeError("BJSON support is unavailable because modules.bjson could not be imported.")
+        raw_text = BJSONFile().open(str(path)).toJson(showDebug=False)
+        raw = json.loads(raw_text)
+        cuboids, model_keys = cls._extract_cuboids_from_geometry_json(raw)
+        return cls(source_type="bjson", source_path=path, data=raw, cuboids=cuboids, active_model_key=(model_keys[0] if model_keys else None), model_keys=model_keys)
 
-        if f"geometry.{model_name}" in data:
-            for bone in data[f"geometry.{model_name}"]["bones"]:
-                name = bone["name"]
-                if name in grouped_data:
-                    for i, (number, update_data) in enumerate(grouped_data[name]):
-                        if i < len(bone["cubes"]):
-                            bone["cubes"][i]["origin"] = update_data.get("origin", bone["cubes"][i]["origin"])
-                            bone["cubes"][i]["size"] = update_data.get("size", bone["cubes"][i]["size"])
+    @classmethod
+    def from_bbmodel(cls, path: Path) -> "ModelDocument":
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cuboids, model_key = cls._extract_cuboids_from_bbmodel(raw)
+        return cls(source_type="bbmodel", source_path=path, data=raw, cuboids=cuboids, active_model_key=model_key, model_keys=[model_key])
 
-                else:
-                   if name in parsed_data:
-                        bone["cubes"][0]["origin"] = parsed_data[name].get("origin", bone["cubes"][0]["origin"])
-                        bone["cubes"][0]["size"] = parsed_data[name].get("size", bone["cubes"][0]["size"])
+    @staticmethod
+    def _extract_cuboids_from_geometry_json(raw: dict[str, Any]) -> tuple[list[Cuboid], list[str]]:
+        cuboids: list[Cuboid] = []
+        model_keys: list[str] = []
+        for geometry_key, geometry_data in raw.items():
+            if not geometry_key.startswith("geometry.") or not isinstance(geometry_data, dict):
+                continue
+            model_keys.append(geometry_key)
+            bones = geometry_data.get("bones", [])
+            if not isinstance(bones, list):
+                continue
+            for bone in bones:
+                if not isinstance(bone, dict):
+                    continue
+                bone_name = str(bone.get("name", "bone"))
+                cubes = bone.get("cubes", []) or []
+                if not isinstance(cubes, list):
+                    continue
+                for cube_index, cube in enumerate(cubes):
+                    if not isinstance(cube, dict):
+                        continue
+                    origin = ModelDocument._numeric3(cube.get("origin"), (0.0, 0.0, 0.0))
+                    size = ModelDocument._numeric3(cube.get("size"), (1.0, 1.0, 1.0))
+                    display_name = f"{bone_name}[{cube_index}]"
+                    cuboids.append(
+                        Cuboid(
+                            geometry_key=geometry_key,
+                            bone_name=bone_name,
+                            cube_index=cube_index,
+                            name=display_name,
+                            origin=origin,
+                            size=size,
+                            uuid=f"{geometry_key}|{bone_name}|{cube_index}",
+                        )
+                    )
+        if not cuboids:
+            raise ValueError("No editable cubes were found in the selected JSON/BJSON file.")
+        return cuboids, model_keys
 
+    @staticmethod
+    def _extract_cuboids_from_bbmodel(raw: dict[str, Any]) -> tuple[list[Cuboid], str]:
+        elements = raw.get("elements", [])
+        if not isinstance(elements, list) or not elements:
+            raise ValueError("No editable Blockbench elements were found in the selected .bbmodel file.")
+        identifier = raw.get("model_identifier") or raw.get("name") or "blockbench_model"
+        model_key = f"geometry.{identifier}"
+        cuboids: list[Cuboid] = []
+        for idx, element in enumerate(elements):
+            if not isinstance(element, dict):
+                continue
+            origin = ModelDocument._numeric3(element.get("from"), (0.0, 0.0, 0.0))
+            to_vec = ModelDocument._numeric3(element.get("to"), (origin[0] + 1.0, origin[1] + 1.0, origin[2] + 1.0))
+            size = to_vec - origin
+            bone_name = str(element.get("__group") or element.get("group") or "root")
+            name = str(element.get("name") or f"element_{idx}")
+            cuboids.append(
+                Cuboid(
+                    geometry_key=model_key,
+                    bone_name=bone_name,
+                    cube_index=idx,
+                    name=name,
+                    origin=origin,
+                    size=size,
+                    uuid=str(element.get("uuid") or f"bb:{idx}"),
+                )
+            )
+        return cuboids, model_key
 
+    def visible_cuboids(self) -> list[tuple[int, Cuboid]]:
+        if self.active_model_key is None:
+            return list(enumerate(self.cuboids))
+        return [(idx, cube) for idx, cube in enumerate(self.cuboids) if cube.geometry_key == self.active_model_key]
 
-    with open(f"{os.path.dirname(geoPath)}\\geometry_updated.json", "w") as f:
-        json.dump(data, f, indent=4)
+    def set_active_model(self, model_key: Optional[str]) -> None:
+        self.active_model_key = model_key
 
-    print(f"Updated data saved in {geoPath}")
+    def _apply_cuboids_to_json(self) -> dict[str, Any]:
+        if self.data is None:
+            raise RuntimeError("This document does not have JSON-backed data.")
+        raw = copy.deepcopy(self.data)
+        grouped: dict[tuple[str, str], list[Cuboid]] = {}
+        for cube in self.cuboids:
+            grouped.setdefault((cube.geometry_key, cube.bone_name), []).append(cube)
 
-    def convert_floats_to_ints(data):
-        if isinstance(data, dict):
-            return {key: convert_floats_to_ints(value) for key, value in data.items()}
-        elif isinstance(data, list):
-            return [convert_floats_to_ints(item) for item in data]
-        elif isinstance(data, float):
-            if data.is_integer():
-                return int(data)
-            else:
-                return data
+        for (geometry_key, bone_name), cubes in grouped.items():
+            geometry = raw.get(geometry_key)
+            if not isinstance(geometry, dict):
+                continue
+            bones = geometry.get("bones", [])
+            if not isinstance(bones, list):
+                continue
+            existing_bone = None
+            for bone in bones:
+                if isinstance(bone, dict) and str(bone.get("name", "")) == bone_name:
+                    existing_bone = bone
+                    break
+            if existing_bone is None:
+                existing_bone = {"name": bone_name, "pivot": [0, 0, 0], "cubes": []}
+                bones.append(existing_bone)
+            existing_list = existing_bone.get("cubes", [])
+            if not isinstance(existing_list, list):
+                existing_list = []
+            existing_bone["cubes"] = [
+                {
+                    **(existing_list[idx] if idx < len(existing_list) and isinstance(existing_list[idx], dict) else {}),
+                    "origin": _round_trip_list(c.origin),
+                    "size": _round_trip_list(c.size),
+                }
+                for idx, c in enumerate(sorted(cubes, key=lambda x: x.cube_index))
+            ]
+        return raw
+
+    def _apply_cuboids_to_bbmodel(self) -> dict[str, Any]:
+        if self.data is None:
+            raise RuntimeError("This document does not have Blockbench-backed data.")
+        raw = copy.deepcopy(self.data)
+        raw.setdefault("meta", {"format_version": "4.0"})
+        raw.setdefault("resolution", {"width": 64, "height": 64})
+        if self.active_model_key and self.active_model_key.startswith("geometry."):
+            raw["model_identifier"] = self.active_model_key.removeprefix("geometry.")
+        if "name" not in raw:
+            raw["name"] = raw.get("model_identifier", "Blockbench Model")
+        original_elements = raw.get("elements", [])
+        if not isinstance(original_elements, list):
+            original_elements = []
+        visible = [cube for _, cube in self.visible_cuboids()]
+        elements: list[dict[str, Any]] = []
+        for idx, cube in enumerate(visible):
+            base = original_elements[idx] if idx < len(original_elements) and isinstance(original_elements[idx], dict) else {}
+            element = copy.deepcopy(base)
+            element["name"] = cube.name
+            element["from"] = _round_trip_list(cube.origin)
+            element["to"] = _round_trip_list(cube.origin + cube.size)
+            element["uuid"] = cube.uuid or element.get("uuid") or f"bb:{idx}"
+            if cube.bone_name != "root":
+                element["__group"] = cube.bone_name
+            elements.append(element)
+        raw["elements"] = elements
+        return raw
+
+    def save_to(self, path: Path, target_type: Optional[str] = None) -> None:
+        target_type = target_type or self.source_type
+        if target_type == "text":
+            self._save_text(path)
+        elif target_type == "json":
+            self._save_json(path)
+        elif target_type == "bjson":
+            self._save_bjson(path)
+        elif target_type == "bbmodel":
+            self._save_bbmodel(path)
         else:
-            return data
-
-    def process_json_file(filename):
-        with open(filename, 'r') as file:
-            data = json.load(file)
-
-        modified_data = convert_floats_to_ints(data)
-
-        with open(filename, 'w') as file:
-            json.dump(modified_data, file, indent=4)
-
-    process_json_file(f"{os.path.dirname(geoPath)}\\geometry_updated.json")
-    time.sleep(0.5)
-    filename0 = os.path.basename(geoPath)
-    getbasename = os.path.basename(os.path.dirname(geoPath))
-
-    if answer == "--bjson":
-        if os.path.exists(".\\hash_database.json"):
-            with open(".\\hash_database.json", 'r') as f01:
-                if "JSON File Loaded, DO NOT CONVERT TO BJSON." not in f01.read():
-                    with open(f"{os.path.dirname(geoPath)}\\geometry_updated.json", 'r', encoding="utf-8") as f:
-                        json_str = f.read()
-                
-                    bjson_file = BJSONFile()
-                    bjson_file.fromJson(json_str)
-                    with open(filename0.replace('.json','.bjson'), 'wb') as f:
-                        f.write(bjson_file.getData())
-                else:
-                    messagebox.showerror("Error","BJSON Model Editor ran into an Issue.\nAnd is unable to Process your Current Conversion Request.\n\nJSON Files cannot be converted into BJSON without proper BJSON Hash Keys.\n\nThese are obtained through Legit BJSON Model Files.")
-                    return
-
-        messagebox.showinfo("Success!", f"BJSON Model File Saved at: {os.path.dirname(__file__)}\\{filename0.replace('.json','.bjson')}")
-    elif answer == "--json":
-        messagebox.showinfo("Success!", f"JSON Model File Saved at: {geoPath}")
-        pass
-    else:
-        messagebox.showerror("Error","BJSON Model Editor ran into an Issue, and is unable to Process your Current Conversion Request.")
-        return
-
-def bodyAndHeadItterations(mode=0):
-    global current_model_file
-    directory = os.path.dirname(__file__)
-    if mode == 1:
-        file_path = f"{current_model_file}"
-        head_counter = 0
-        body_counter = 0
-        headOcc = 0
-        bodyOcc = 0
-        
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
-            file.seek(0x00)
-            whole_file = file.read()
-            file.seek(0x00)
-            headOcc += whole_file.count("head")
-            file.seek(0x00)
-            bodyOcc += whole_file.count("body")
-            print(headOcc, bodyOcc)
-        
-        new_lines = []
-        for line in lines:
-            if "head" in line and headOcc > 1:
-                new_line = re.sub(r'\bhead\b', f'{head_counter}head', line)
-                head_counter += 1
-            elif "body" in line and bodyOcc > 1:
-                new_line = re.sub(r'\bbody\b', f'{body_counter}body', line)
-                body_counter += 1
-            else:
-                new_line = line
-        
-            new_lines.append(new_line)
-
-        with open(file_path, 'w') as file:
-            file.writelines(new_lines)
-
-        return
-    else:
-        for filename in os.listdir(f"{directory}\\data"):
-            if filename.endswith(".txt") and "geometry." in filename:
-                file_path = os.path.join(f"{directory}\\data", filename)
-        
-                head_counter = 0
-                body_counter = 0
-                headOcc = 0
-                bodyOcc = 0
-        
-                with open(file_path, 'r') as file:
-                    lines = file.readlines()
-                    file.seek(0x00)
-                    whole_file = file.read()
-                    headOcc += whole_file.count("head")
-                    bodyOcc += whole_file.count("body")
-                    print(headOcc, bodyOcc)
-        
-                new_lines = []
-                for line in lines:
-                    if "head" in line and headOcc > 1:
-                        new_line = re.sub(r'\bhead\b', f'{head_counter}head', line)
-                        head_counter += 1
-                    elif "body" in line and bodyOcc > 1:
-                        new_line = re.sub(r'\bbody\b', f'{body_counter}body', line)
-                        body_counter += 1
-                    else:
-                        new_line = line
-            
-                    new_lines.append(new_line)
-
-                with open(file_path, 'w') as file:
-                    file.writelines(new_lines)
-
-def json2model(main_string, directory_name, random_string, bjsonFile, directory=os.path.dirname(__file__)):
-    if '"size": [' not in main_string:
-        messagebox.showerror('Error',"The Provided JSON/BJSON File was Not a Model.")
-        sys.exit(1)
-    else:
-        json_path = f'{directory}\\models\\{directory_name}\\{random_string}.json'
-        with open(json_path, 'w') as json_file:
-            json_file.write(main_string)
-
-        with open(json_path, "r") as new_json_file:
-            json_data = json.load(new_json_file)
-
-        for key, value in json_data.items():
-            if key.startswith("geometry.") and "bones" in value:
-                if ":" in key:
-                    key = key.replace(":", "_")
-                bones = value["bones"]
-                output_lines = []
-                for bone in bones:
-                    if "name" in bone and "cubes" in bone:
-                        name = bone["name"]
-                        cubes = bone["cubes"]
-                        for cube in cubes:
-                            if "origin" in cube and "size" in cube:
-                                origin = cube["origin"]
-                                size = cube["size"]
-                                output_lines.append(f"{name}")
-                                output_lines.append(f"{origin[0]}, {origin[1]}, {origin[2]}")
-                                output_lines.append(f"{size[0]}, {size[1]}, {size[2]}")
-                                output_lines.append("")
-
-                output_directory = os.path.join(directory, "data")
-                os.makedirs(output_directory, exist_ok=True)
-                output_path = os.path.join(output_directory, f"{key}.txt")
-                with open(output_path, 'w') as output_file:
-                    output_file.write("\n".join(output_lines))
-
-        print(f"Converted BJSON Data Saved: {output_directory}")
-        with open(f'{directory}\\filename.txt','w') as outf:
-            outf.write(f'{directory}\\models\\{directory_name}\\{random_string}.json\n')
-            outf.write(f"{bjsonFile}")
-
-    time.sleep(0.5)
-    bodyAndHeadItterations()
-
-def bjson2models():
-    if not os.path.exists('.\\filename.txt'):
-        messagebox.showinfo("Welcome", f"Welcome to the MC3DS BJSON Model Editor!\nYou can now edit MC3DS Models easier than ever.\n\nVersion: v{VERSION}.0\nDeveloped by: Cracko298.")
-
-    character = string.ascii_letters + string.digits
-    random_string = ''.join(random.choice(character) for _ in range(16))
-    directory = os.path.dirname(__file__)
-    bjsonFile = filedialog.askopenfilename(initialdir=f"{os.path.dirname(__file__)}", filetypes=[("BJSON Model Files", "*.bjson")])
-
-    if not bjsonFile:
-        bjsonFile = f"{os.path.dirname(__file__)}\\modules\\exampleModel.bjson"
-
-    file_name0 = os.path.basename(bjsonFile)
-    directory_name = file_name0.replace('.bjson','')
-    os.makedirs(f"{directory}\\models\\{directory_name}", exist_ok=True)
-
-    bjsonfileOpen = BJSONFile().open(bjsonFile)
-    main_string = bjsonfileOpen.toJson(showDebug=False)
-
-    json2model(main_string, directory_name, random_string, bjsonFile, directory)
-
-
-def json2modelBase():
-    character = string.ascii_letters + string.digits
-    random_string = ''.join(random.choice(character) for _ in range(16))
-    directory = os.path.dirname(__file__)
-    jsonFile = filedialog.askopenfilename(initialdir=f"{os.path.dirname(__file__)}", filetypes=[("JSON Model Files", "*.json")])
-    
-    if not jsonFile:
-        messagebox.showerror("Error", "No JSON Model File Selected.")
-        return
-    
-    file_name0 = os.path.basename(jsonFile)
-    directory_name = file_name0.replace('.json','')
-    os.makedirs(f"{directory}\\models\\{directory_name}",exist_ok=True)
-
-    with open(jsonFile,'r') as f0:
-        main_string = f0.read()
-
-    json2model(main_string, directory_name, random_string, jsonFile, directory)
-
-def savetojson():
-    models2jsonf('--json')
-
-def savetobjson():
-    models2jsonf('--bjson')
-
-def export_as_gltf():
-    global objects, current_model_file
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
-
-    gltf_file_path = filedialog.asksaveasfilename(
-        defaultextension=".gltf",
-        filetypes=[("GLTF files", "*.gltf")],
-        initialdir=os.getcwd(),
-        title="Save GLTF File"
-    )
-
-    if not gltf_file_path:
-        return
-
-    with open(current_model_file, 'r') as file:
-        data = file.read()
-
-    parts = data.strip().split("\n\n")
-    vertices = []
-    indices = []
-    index_offset = 0
-
-    for part in parts:
-        lines = part.split("\n")
-        if len(lines) < 3:
-            continue
-        position = list(map(float, lines[1].split(", ")))
-        size = list(map(float, lines[2].split(", ")))
-        x, y, z = position
-        w, h, d = size
-        vertices.extend([
-            x, y, z,
-            x + w, y, z,
-            x + w, y + h, z,
-            x, y + h, z,
-            x, y, z + d,
-            x + w, y, z + d,
-            x + w, y + h, z + d,
-            x, y + h, z + d
-        ])
-
-        indices.extend([
-            index_offset, index_offset + 2, index_offset + 1, index_offset, index_offset + 3, index_offset + 2,
-            index_offset + 4, index_offset + 5, index_offset + 6, index_offset + 4, index_offset + 6, index_offset + 7,
-            index_offset, index_offset + 4, index_offset + 7, index_offset, index_offset + 7, index_offset + 3,
-            index_offset + 1, index_offset + 2, index_offset + 6, index_offset + 1, index_offset + 6, index_offset + 5,
-            index_offset + 2, index_offset + 3, index_offset + 7, index_offset + 2, index_offset + 7, index_offset + 6,
-            index_offset, index_offset + 1, index_offset + 5, index_offset, index_offset + 5, index_offset + 4
-        ])
-        index_offset += 8
-
-    gltf = GLTF2()
-    scene = Scene()
-    gltf.scenes.append(scene)
-    gltf.scene = 0
-    node = Node()
-    gltf.nodes.append(node)
-    scene.nodes.append(0)
-    mesh = Mesh()
-    primitive = Primitive()
-    mesh.primitives.append(primitive)
-    gltf.meshes.append(mesh)
-    node.mesh = 0
-
-    vertices_bytes = struct.pack(f'{len(vertices)}f', *vertices)
-    indices_bytes = struct.pack(f'{len(indices)}I', *indices)
-
-    buffer_data = vertices_bytes + indices_bytes
-    buffer = Buffer()
-    buffer.uri = "data:application/octet-stream;base64," + base64.b64encode(buffer_data).decode('utf-8')
-    buffer.byteLength = len(buffer_data)
-    gltf.buffers.append(buffer)
-    bufferView_vertices = BufferView()
-    bufferView_vertices.buffer = 0
-    bufferView_vertices.byteOffset = 0
-    bufferView_vertices.byteLength = len(vertices_bytes)
-    gltf.bufferViews.append(bufferView_vertices)
-    bufferView_indices = BufferView()
-    bufferView_indices.buffer = 0
-    bufferView_indices.byteOffset = len(vertices_bytes)
-    bufferView_indices.byteLength = len(indices_bytes)
-    gltf.bufferViews.append(bufferView_indices)
-    accessor_vertices = Accessor()
-    accessor_vertices.bufferView = 0
-    accessor_vertices.byteOffset = 0
-    accessor_vertices.componentType = 5126
-    accessor_vertices.count = len(vertices) // 3
-    accessor_vertices.type = "VEC3"
-    gltf.accessors.append(accessor_vertices)
-    accessor_indices = Accessor()
-    accessor_indices.bufferView = 1
-    accessor_indices.byteOffset = 0
-    accessor_indices.componentType = 5125
-    accessor_indices.count = len(indices)
-    accessor_indices.type = "SCALAR"
-    gltf.accessors.append(accessor_indices)
-    primitive.attributes.POSITION = 0
-    primitive.indices = 1
-    gltf.save(gltf_file_path)
-
-def parse_input_file(filename):
-    with open(filename, 'r') as file:
-        lines = [line.strip() for line in file.readlines() if line.strip()]
-
-    data = []
-    for i in range(0, len(lines), 3):
-        name = lines[i].strip()
-        position = tuple(map(float, lines[i + 1].strip().split(', ')))
-        size = tuple(map(float, lines[i + 2].strip().split(', ')))
-        data.append((name, position, size))
-    
-    return data
-
-def export_as_ply():
-    global objects, current_model_file
-    data = parse_input_file(current_model_file)
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
-
-    ply_file_path = filedialog.asksaveasfilename(
-        defaultextension=".ply",
-        filetypes=[("PLY files", "*.ply")],
-        initialdir=os.getcwd(),
-        title="Save PLY File"
-    )
-
-    if not ply_file_path:
-        return
-    
-    with open(ply_file_path, 'w') as file:
-        vertex_list = []
-        face_list = []
-        
-        for name, position, size in data:
-            x, y, z = position
-            w, h, d = size
-            
-            vertices = [
-                (x, y, z), (x + w, y, z), (x + w, y + h, z), (x, y + h, z),
-                (x, y, z + d), (x + w, y, z + d), (x + w, y + h, z + d), (x, y + h, z + d)
-            ]
-            vertex_list.extend(vertices)
-            
-            start_index = len(vertex_list) - 8
-            faces = [
-                (start_index, start_index + 1, start_index + 2, start_index + 3),
-                (start_index + 4, start_index + 5, start_index + 6, start_index + 7),
-                (start_index, start_index + 1, start_index + 5, start_index + 4),
-                (start_index + 1, start_index + 2, start_index + 6, start_index + 5),
-                (start_index + 2, start_index + 3, start_index + 7, start_index + 6),
-                (start_index + 3, start_index + 0, start_index + 4, start_index + 7)
-            ]
-            face_list.extend(faces)
-        
-        file.write("ply\n")
-        file.write("format ascii 1.0\n")
-        file.write(f"element vertex {len(vertex_list)}\n")
-        file.write("property float x\n")
-        file.write("property float y\n")
-        file.write("property float z\n")
-        file.write(f"element face {len(face_list)}\n")
-        file.write("property list uchar int vertex_indices\n")
-        file.write("end_header\n")
-        
-        for vertex in vertex_list:
-            file.write(f"{vertex[0]} {vertex[1]} {vertex[2]}\n")
-        
-        for face in face_list:
-            file.write(f"4 {face[0]} {face[1]} {face[2]} {face[3]}\n")
-
-def updateApplication():
-    global VERSION
-    api_url = "https://api.github.com/repos/Cracko298/MC3DS-Model-Editor/releases/latest"
-    response = requests.get(api_url)
-    response_data = response.json()
-    latest_version_tag = response_data['tag_name']
-    try:
-        latest_version = float(latest_version_tag)
-    except ValueError:
-        print("Error: Latest version tag could not be converted to a float.")
-        messagebox.showerror("Error", "Newest Version of BJSON Model Editor isn't a float value.")
-        return
-
-    if latest_version > VERSION:
-        answer = messagebox.askyesno("Update Avaliable", "An Update is Avaliable to Download.\nWould you like to download and install it?\n\nThis will require an Application restart automatically after installing.\nAll unsaved Model Data will be lost.\nAll saved Model Data won't be touched.")
-
-        if answer:
-            root.destroy()
-            assets = response_data['assets']
-            zip_url = None
-            for asset in assets:
-                if asset['name'].endswith('.zip') and ".py" in os.path.basename(__file__):
-                    zip_url = asset['browser_download_url']
-                    break
-                if asset['name'].endswith('.exe') and ".exe" in os.path.basename(__file__):
-                    exe_url = asset['browser_download_url']
-                    break
-
-            if zip_url is None:
-                print("Error: No ZIP file found in the latest release.")
-                messagebox.showerror("Error", "No ZIP file found in the latest release.")
-                return
-            
-            if ".py" in os.path.basename(__file__):
-                zip_response = requests.get(zip_url)
-                zip_data = zip_response.content
-
-                with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
-                    extract_path = os.path.dirname(os.path.abspath(__file__))
-                    z.extractall(extract_path)
-
-                os.system(f'python {__file__}')
-                quit_app()
-
-            else:
-                if exe_url is None:
-                    print("Error: No Executable file found in the latest release.")
-                    messagebox.showerror("Error", "No Executable file found in the latest release.")
-                    return
-                
-                exe_response = requests.get(exe_url)
-                exe_data = exe_response.content
-
-                with open(f"{os.path.dirname}\\{os.path.basename(__file__)}", 'w') as f0:
-                    f0.write(exe_data)
-                    f0.close()
-                
-                os.system(f"start {__file__}")
-                quit_app()
-
-    if latest_version <= VERSION:
-        answer = messagebox.showinfo("Notice", "You have the Latest Release of MC3DS BJSON Model Editor.")
-        return
-
-def basicAboutDiag():
-    messagebox.showinfo("AboutDiag", f"Version: '{VERSION}'.\nHash Database Exists?: '{os.path.exists(".\\hash_database.json")}'.\nModel Cache File Exists?: '{os.path.exists(".\\filename.txt")}'.\n\nMC3DS BJSON Model Editor Developer: Cracko298.\npyBjson Python Module Developer: STBrian.")
-
-def contactsDiag():
-    messagebox.showinfo("AboutDiag", f"Personal Email: rfddfd5567@gmail.com\nBuisness Email: batchbatch298@outlook.com\n\nName: Phinehas Charles Beresford (Cracko298).")
-
-def licsenseDiag():
-    messagebox.showinfo("AboutDiag", f"Current License: 'Apache License v2.0'.\n\nPlease read the License throughly before 3rd party distrobution.")
-
-def export_as_dae():
-    global objects, current_model_file
-
-    data = parse_input_file(current_model_file)
-    if not objects:
-        messagebox.showerror("Export Error", "No objects to export.")
-        return
-
-    output_file = filedialog.asksaveasfilename(
-        defaultextension=".dae",
-        filetypes=[("DAE files", "*.dae")],
-        initialdir=os.getcwd(),
-        title="Save DAE File"
-    )
-
-    if not output_file:
-        return
-    
-    COLLADA_NS = "http://www.collada.org/2005/11/COLLADASchema"
-    ET = lxml.etree.ElementTree
-    root = lxml.etree.Element("COLLADA", xmlns=COLLADA_NS, version="1.4.1")
-
-    asset = lxml.etree.SubElement(root, "asset")
-    lxml.etree.SubElement(asset, "contributor")
-    lxml.etree.SubElement(asset, "created").text = "2024-08-18T00:00:00"
-    lxml.etree.SubElement(asset, "modified").text = "2024-08-18T00:00:00"
-    lxml.etree.SubElement(asset, "unit", name="meter", meter="1.0")
-    lxml.etree.SubElement(asset, "up_axis").text = "Y_UP"
-
-    library_geometries = lxml.etree.SubElement(root, "library_geometries")
-
-    for name, position, size in data:
-        geometry = lxml.etree.SubElement(library_geometries, "geometry", id=name, name=name)
-        mesh = lxml.etree.SubElement(geometry, "mesh")
-
-        x, y, z = position
-        w, h, d = size
-        vertices = [
-            (x, y, z), (x + w, y, z), (x + w, y + h, z), (x, y + h, z),
-            (x, y, z + d), (x + w, y, z + d), (x + w, y + h, z + d), (x, y + h, z + d)
-        ]
-        vertex_data = " ".join(f"{v[0]} {v[1]} {v[2]}" for v in vertices)
-        
-        source = lxml.etree.SubElement(mesh, "source", id=f"{name}_positions")
-        float_array = lxml.etree.SubElement(source, "float_array", id=f"{name}_positions-array", count=str(len(vertices) * 3))
-        float_array.text = vertex_data
-        
-        technique_common = lxml.etree.SubElement(source, "technique_common")
-        accessor = lxml.etree.SubElement(technique_common, "accessor", source=f"#{name}_positions-array", count="8", stride="3")
-        lxml.etree.SubElement(accessor, "param", name="X", type="float")
-        lxml.etree.SubElement(accessor, "param", name="Y", type="float")
-        lxml.etree.SubElement(accessor, "param", name="Z", type="float")
-
-        vertices_elem = lxml.etree.SubElement(mesh, "vertices", id=f"{name}_vertices")
-        lxml.etree.SubElement(vertices_elem, "input", semantic="POSITION", source=f"#{name}_positions")
-
-        triangles = lxml.etree.SubElement(mesh, "triangles", count="12")
-        lxml.etree.SubElement(triangles, "input", semantic="VERTEX", source=f"#{name}_vertices", offset="0")
-        p_elem = lxml.etree.SubElement(triangles, "p")
-        faces = [
-            (0, 1, 2), (2, 3, 0), (4, 5, 6), (6, 7, 4),
-            (0, 1, 5), (5, 4, 0), (1, 2, 6), (6, 5, 1),
-            (2, 3, 7), (7, 6, 2), (3, 0, 4), (4, 7, 3)
-        ]
-        p_elem.text = " ".join(str(index) for face in faces for index in face)
-
-    tree = ET(root)
-    tree.write(output_file, pretty_print=True, xml_declaration=True, encoding='UTF-8')
-
-def data2json():
-    global objects, current_model_file
-
-    modelFile = os.path.basename(current_model_file)
-    modelFile = modelFile.replace('.txt','')
-    
-    with open('.\\filename.txt','r') as f0:
-        firstLine = f0.readline()
-        firstLine = firstLine.replace("\n","")
-        f0.close()
-
-    getFullPath = os.path.dirname(firstLine)
-
-    if os.path.exists(f"{getFullPath}\\geometry_updated.json"):
-        firstLine = f"{getFullPath}\\geometry_updated.json"
-
-    with open(firstLine, 'r') as f1:
-        data = json.load(f1)
-
-    if modelFile in data:
-        key_data = data[modelFile]
-
-        if not objects:
-            messagebox.showerror("Export Error", "No objects to export.")
-            return
-
-        output_file = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
-            initialdir=os.getcwd(),
-            title="Save JSON File"
-        )
-
-        if not output_file:
-            return
-        
-        with open(output_file, 'w') as f:
-            json.dump({modelFile: key_data}, f, indent=4)
-
-        messagebox.showinfo("Notice", f"Success! Saved JSON Model to: '{output_file}'.")
-    else:
-        messagebox.showerror("Error", f"No Model was Found inside of JSON File called '{modelFile}'.")
-
-def rld(newFileSet):
-    model_selector['values'] = newFileSet
-
-def reloadComboBox():
-    files = os.listdir(".\\data")
-    newFileSet = []
-    for file in files:
-        if "geometry" in file and ".txt" in file:
-            newFileSet.append(file)
-
-    rld(newFileSet)
-
-def importBBmodel():
-    global objects, current_model_file
-    filename = filedialog.askopenfilename(
-        defaultextension=".bbmodel",
-        filetypes=[("BlockBench files", "*.bbmodel")],
-        initialdir=os.getcwd(),
-        title="Load BlockBench File"
-    )
-
-    if not filename:
-        return
-
-    messagebox.showinfo("Notice", "BlockBench Models are Basically Bedrock/Java Entity Models.\nJust with more information than what is theoretically needed.\nMaking them incompatible with Minecraft out of the Box.\n\nThe Application will now convert directly to Bedrock Entity.")
-    with open(filename, 'r') as f0:
-        json_string = f0.read()
-        data = json.loads(json_string)
-
-    savedFileName = data['name']
-    modelName = f"geometry.{data['model_identifier']}"
-    print(savedFileName)
-    print(modelName)
-
-    if 'elements' in data:
-        name_count = sum(1 for element in data['elements'] if 'name' in element)
-
-    textureWidth = data['resolution']['width']
-    textureHeight = data['resolution']['height']
-    fileVersion = float(data['meta']['format_version'])
-    if fileVersion >= 4.31 or fileVersion < float(4):
-        messagebox.showerror("Error", "BlockBench Model Format is Greater than Expected.")
-        return
-    
-    print(textureHeight)
-    print(textureWidth)
-
-    os.makedirs(f'.\\data', exist_ok=True)
-    with open(f'.\\data\\{modelName}.txt', 'w') as f1:
-        for i in range(name_count):
-            element = data['elements'][i]
-            f1.write(f"{element['name']}\n")
-            px, py, pz = element['from']
-            origin = element['from']
-            destination = element['to']
-            size = [destination[j] - origin[j] for j in range(3)]
-            dx, dy, dz = size
-            f1.write(f"{px}, {py}, {pz}\n{dx}, {dy}, {dz}\n\n")
-
-    bodyAndHeadItterations(1)
-
-    reloadComboBox()
-    current_model_file = f"{os.path.dirname(__file__)}\\data\\{modelName}.txt"
-    objects = read_objects_from_file(current_model_file)
-    object_selector.config(values=[obj.name for obj in objects])
-    object_selector.set(f'')
-    model_selector.set(f"{modelName}.txt")
-    draw_3d_plot(objects, canvas)
-
-def on_press(event):
-    global last_x, last_y
-    last_x, last_y = event.x, event.y
-
-def on_motion(event):
-    global last_x, last_y, yxFloatValue, elevation, azimuth
-    if last_x is not None and last_y is not None:
-        dx = event.x - last_x
-        dy = event.y - last_y
-        azimuth -= dx * yxFloatValue
-        elevation += dy * yxFloatValue
-        ax.azim = azimuth
-        ax.elev = elevation
-        last_x, last_y = event.x, event.y
-        canvas.draw()
-
-def on_release(event):
-    global last_x, last_y
-    last_x, last_y = None, None
-
-def set_drag_speed():
-    global yxFloatValue
-    speed = simpledialog.askfloat("Set New Mouse Speed", "Enter Mouse-Drag Speed:", initialvalue=yxFloatValue, minvalue=0.01, maxvalue=1.0)
-    if speed is not None:
-        yxFloatValue = speed
-
-def set_zoom_speed():
-    global inZoomFactor, outZoomFactor
-    zoomMult0 = simpledialog.askfloat("Set New Zoom-In Speed", "Enter Zoom-In Speed (0.01 - 0.99):", initialvalue=inZoomFactor, minvalue=0.01, maxvalue=0.99)
-    zoomMult1 = simpledialog.askfloat("Set New Zoom-Out Speed", "Enter Zoom-Out Speed (1.01 - 9.99):", initialvalue=outZoomFactor, minvalue=1.01, maxvalue=9.99)
-    if zoomMult0 is not None:
-        inZoomFactor = zoomMult0
-    if zoomMult1 is not None:
-        outZoomFactor = zoomMult1
-
-def set_wasd_speed():
-    global increaseEandA
-    wasdSpeed = simpledialog.askfloat("Set New Arrow/WASD Speed", "Enter Arrow/WASD Speed (0.1 - 50):", initialvalue=increaseEandA, minvalue=0.1, maxvalue=50.0)
-    if wasdSpeed is not None:
-        increaseEandA = wasdSpeed
-
-def movementWASD(event):
-    global azimuth, elevation, increaseEandA
-
-    if event.key == 'w':
-        elevation += increaseEandA
-    elif event.key == 's':
-        elevation -= increaseEandA
-    elif event.key == 'a':
-        azimuth -= increaseEandA
-    elif event.key == 'd':
-        azimuth += increaseEandA
-    elif event.key == 'up':
-        elevation += increaseEandA
-    elif event.key == 'down':
-        elevation -= increaseEandA
-    elif event.key == 'left':
-        azimuth -= increaseEandA
-    elif event.key == 'right':
-        azimuth += increaseEandA
-
-    ax.view_init(elevation, azimuth)
-    canvas.draw()
-
-def openCDBFile():
-    foldername = filedialog.askdirectory(
-        initialdir=os.getcwd(),
-        title="3DS World Directory"
-    )
-    if not foldername:
-        return
-    
-    nameOfFolder = os.path.basename(foldername)
-    numberOfA = nameOfFolder.count("A")
-
-    print(numberOfA)
-    if 'A=' not in nameOfFolder and numberOfA >= 3 and os.path.exists(f"{foldername}\\db\\cdb"):
-        messagebox.showerror("Error", "Invalid World Loaded.")
-        return
-    
-    os.makedirs(f"{os.path.dirname(__file__)}\\worlds", exist_ok=True)
-    os.system(f'python .\\modules\\cdbParser.py -o "{os.path.dirname(__file__)}\\worlds\\{nameOfFolder}" "{foldername}"')
-
-def disable_keyboard(event):
-    root.focus()
-    return "break"
-
-def toggle_preview_rotation():
-    global global_preview_rotation
-    global_preview_rotation = not global_preview_rotation
-
-def add_new_block():
-    global current_model_file, objects
-    if not current_model_file:
-        messagebox.showerror("Error", "No model file currently open.")
-        return
-
-    with open(current_model_file, 'r') as file:
-        lines = file.readlines()
-        existing_names = [lines[i].strip() for i in range(0, len(lines), 4)]
-
-    base_names = set()
-    for name in existing_names:
-        if name[0].isdigit() or name[-1].isdigit():
-            continue
-        if any(char.isdigit() for char in name):
-            continue
-        base_names.add(name)
-
-    if not base_names:
-        messagebox.showerror("Error", "No valid block types found in file.\nNames with numbers are excluded.")
-        return
-
-    dialog = tk.Toplevel()
-    dialog.title("Add New Block")
-    dialog.geometry("750x500")
-    dialog.resizable(False, False)
-    dialog.transient()
-    dialog.grab_set()
-    left_frame = ttk.Frame(dialog)
-    left_frame.pack(side=tk.LEFT, padx=10, pady=10, fill="y")
-    right_frame = ttk.Frame(dialog)
-    right_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill="both", expand=True)
-    preview_fig = plt.figure(figsize=(7.5, 5))
-    preview_fig.patch.set_facecolor('darkgray')
-    preview_ax = preview_fig.add_subplot(111, projection='3d')
-    preview_canvas = FigureCanvasTkAgg(preview_fig, master=right_frame)
-    preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-    preview_fig.canvas.callbacks.callbacks.clear()
-    preview_canvas.mpl_disconnect(preview_canvas.get_tk_widget().bind('<Button-1>'))
-    preview_canvas.mpl_disconnect(preview_canvas.get_tk_widget().bind('<B1-Motion>'))
-    preview_canvas.mpl_disconnect(preview_canvas.get_tk_widget().bind('<ButtonRelease-1>'))
-    preview_canvas.mpl_disconnect(preview_canvas.get_tk_widget().bind('<MouseWheel>'))
-    preview_canvas.get_tk_widget().unbind_all('<Key>')
-    preview_ax.set_position([0, 0, 1, 1])
-    preview_ax.set_axis_off()
-    rotation_angle = 0
-    animation_id = None
-    last_values = {'pos': None, 'size': None}
-    def update_preview():
-        nonlocal rotation_angle, animation_id, last_values
+            raise ValueError(f"Unsupported save type: {target_type}")
+        self.source_path = path
+        self.source_type = target_type
+        if target_type in {"json", "bjson"}:
+            self.data = self._apply_cuboids_to_json()
+        elif target_type == "bbmodel":
+            self.data = self._apply_cuboids_to_bbmodel()
+        self.dirty = False
+
+    def _save_text(self, path: Path) -> None:
+        with path.open("w", encoding="utf-8") as f:
+            for _, cube in self.visible_cuboids():
+                f.write(f"{cube.name}\n")
+                f.write(", ".join(_fmt_number(v) for v in cube.origin.tolist()) + "\n")
+                f.write(", ".join(_fmt_number(v) for v in cube.size.tolist()) + "\n\n")
+
+    def _save_json(self, path: Path) -> None:
+        raw = self._apply_cuboids_to_json() if self.data is not None else _cuboids_to_basic_geometry_json([cube for _, cube in self.visible_cuboids()])
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=4)
+
+    def _save_bjson(self, path: Path) -> None:
+        if BJSONFile is None:
+            raise RuntimeError("BJSON support is unavailable because modules.bjson could not be imported.")
+        raw = self._apply_cuboids_to_json() if self.data is not None else _cuboids_to_basic_geometry_json([cube for _, cube in self.visible_cuboids()])
+        json_text = json.dumps(raw, indent=4)
+        bjson_file = BJSONFile()
+        bjson_file.fromJson(json_text)
+        with path.open("wb") as f:
+            f.write(bjson_file.getData())
+
+    def _save_bbmodel(self, path: Path) -> None:
+        raw = self._apply_cuboids_to_bbmodel() if self.data is not None else _cuboids_to_basic_bbmodel([cube for _, cube in self.visible_cuboids()], self.active_model_key)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=4)
+
+
+class ModelEditorApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"{APP_TITLE} v{APP_VERSION}")
+        self.root.geometry("1460x860")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.document = ModelDocument()
+        self.filtered_indices: list[int] = []
+        self.current_index: Optional[int] = None
+        self.drag_last_xy: Optional[tuple[int, int]] = None
+        self.camera_azim = 35
+        self.camera_elev = 25
+        self.zoom_scale = 1.0
+        self.status_var = tk.StringVar(value="Ready")
+        self.search_var = tk.StringVar()
+        self.model_info_var = tk.StringVar(value="No model loaded")
+
+        self._build_style()
+        self._build_ui()
+        self._bind_shortcuts()
+        self.new_document()
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self.root)
         try:
-            current_pos = [float(pos_x.get()), float(pos_y.get()), float(pos_z.get())]
-            current_size = [float(size_x.get()), float(size_y.get()), float(size_z.get())]
-            preview_ax.clear()
-            preview_ax.set_facecolor('darkgray')
-            preview_obj = Object3D("preview", current_pos, current_size)
-            corners = preview_obj.get_corners()
-            verts = [
-                [corners[0], corners[1], corners[5], corners[4]],
-                [corners[7], corners[6], corners[2], corners[3]],
-                [corners[0], corners[3], corners[7], corners[4]],
-                [corners[1], corners[2], corners[6], corners[5]],
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Treeview", rowheight=24)
+        style.configure("Title.TLabel", font=("Segoe UI", 10, "bold"))
+
+    def _build_ui(self) -> None:
+        self._build_menu()
+
+        toolbar = ttk.Frame(self.root, padding=(8, 8, 8, 4))
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        for text, command in [
+            ("New", self.new_document),
+            ("Open", self.open_model),
+            ("Save", self.save_model),
+            ("Save As", self.save_model_as),
+            ("Add Cube", self.add_cube),
+            ("Duplicate", self.duplicate_selected_cube),
+            ("Delete", self.delete_selected_cube),
+            ("Scale x2", lambda: self.scale_all(2.0)),
+            ("Scale 0.5", lambda: self.scale_all(0.5)),
+            ("Center", self.center_model),
+        ]:
+            ttk.Button(toolbar, text=text, command=command).pack(side=tk.LEFT, padx=3)
+
+        ttk.Separator(self.root).pack(fill=tk.X, padx=8)
+
+        main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(main, padding=8)
+        center = ttk.Frame(main, padding=8)
+        right = ttk.Frame(main, padding=8)
+        main.add(left, weight=28)
+        main.add(center, weight=52)
+        main.add(right, weight=26)
+
+        ttk.Label(left, text="Model Explorer", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(left, textvariable=self.model_info_var).pack(anchor="w", pady=(0, 4))
+
+        model_row = ttk.Frame(left)
+        model_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(model_row, text="Model").pack(side=tk.LEFT)
+        self.active_model_var = tk.StringVar()
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.active_model_var, state="readonly")
+        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        self.model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
+
+        search_row = ttk.Frame(left)
+        search_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Entry(search_row, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(search_row, text="Filter", command=self.refresh_cube_tree).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(search_row, text="Clear", command=self.clear_filter).pack(side=tk.LEFT, padx=(4, 0))
+
+        self.cube_tree = ttk.Treeview(left, columns=("bone", "origin", "size"), show="headings", selectmode="browse")
+        self.cube_tree.heading("bone", text="Bone")
+        self.cube_tree.heading("origin", text="Origin")
+        self.cube_tree.heading("size", text="Size")
+        self.cube_tree.column("bone", width=120, stretch=False)
+        self.cube_tree.column("origin", width=120, stretch=False)
+        self.cube_tree.column("size", width=110, stretch=False)
+        self.cube_tree.pack(fill=tk.BOTH, expand=True)
+        self.cube_tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.cube_tree.bind("<Double-1>", lambda _e: self.focus_inspector())
+
+        left_buttons = ttk.Frame(left)
+        left_buttons.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(left_buttons, text="Add", command=self.add_cube).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(left_buttons, text="Duplicate", command=self.duplicate_selected_cube).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+        ttk.Button(left_buttons, text="Delete", command=self.delete_selected_cube).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        ttk.Label(center, text="3D Preview", style="Title.TLabel").pack(anchor="w")
+        preview_help = ttk.Label(center, text="Drag to rotate • Mouse wheel to zoom")
+        preview_help.pack(anchor="w", pady=(0, 6))
+
+        self.figure = plt.Figure(figsize=(7, 6), dpi=100)
+        self.ax = self.figure.add_subplot(111, projection="3d")
+        self.canvas = FigureCanvasTkAgg(self.figure, master=center)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("scroll_event", self.on_scroll_plot)
+        self.canvas.get_tk_widget().bind("<ButtonPress-1>", self.on_drag_start)
+        self.canvas.get_tk_widget().bind("<B1-Motion>", self.on_drag_motion)
+        self.canvas.get_tk_widget().bind("<ButtonRelease-1>", self.on_drag_end)
+
+        preview_buttons = ttk.Frame(center)
+        preview_buttons.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(preview_buttons, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(preview_buttons, text="Frame Model", command=self.redraw_preview).pack(side=tk.LEFT)
+
+        ttk.Label(right, text="Inspector", style="Title.TLabel").pack(anchor="w")
+
+        form = ttk.Frame(right)
+        form.pack(fill=tk.X, pady=(6, 8))
+        form.columnconfigure(1, weight=1)
+
+        self.name_var = tk.StringVar()
+        self.geometry_var = tk.StringVar()
+        self.bone_var = tk.StringVar()
+        self.origin_vars = [tk.StringVar(), tk.StringVar(), tk.StringVar()]
+        self.size_vars = [tk.StringVar(), tk.StringVar(), tk.StringVar()]
+
+        self._add_labeled_entry(form, 0, "Display Name", self.name_var)
+        self._add_labeled_entry(form, 1, "Geometry", self.geometry_var, readonly=True)
+        self._add_labeled_entry(form, 2, "Bone", self.bone_var, readonly=True)
+
+        ttk.Label(form, text="Origin").grid(row=3, column=0, sticky="w", pady=4)
+        origin_row = ttk.Frame(form)
+        origin_row.grid(row=3, column=1, sticky="ew", pady=4)
+        for idx, var in enumerate(self.origin_vars):
+            ttk.Entry(origin_row, textvariable=var, width=8).pack(side=tk.LEFT, padx=(0, 4 if idx < 2 else 0))
+
+        ttk.Label(form, text="Size").grid(row=4, column=0, sticky="w", pady=4)
+        size_row = ttk.Frame(form)
+        size_row.grid(row=4, column=1, sticky="ew", pady=4)
+        for idx, var in enumerate(self.size_vars):
+            ttk.Entry(size_row, textvariable=var, width=8).pack(side=tk.LEFT, padx=(0, 4 if idx < 2 else 0))
+
+        inspector_buttons = ttk.Frame(right)
+        inspector_buttons.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(inspector_buttons, text="Apply Changes", command=self.apply_inspector_changes).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(inspector_buttons, text="Reset Fields", command=self.load_current_cube_into_form).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        quick_actions = ttk.LabelFrame(right, text="Quick Actions", padding=8)
+        quick_actions.pack(fill=tk.X)
+        ttk.Button(quick_actions, text="Move +X", command=lambda: self.nudge_selected(1, 0, 0)).pack(fill=tk.X, pady=2)
+        ttk.Button(quick_actions, text="Move -X", command=lambda: self.nudge_selected(-1, 0, 0)).pack(fill=tk.X, pady=2)
+        ttk.Button(quick_actions, text="Move +Y", command=lambda: self.nudge_selected(0, 1, 0)).pack(fill=tk.X, pady=2)
+        ttk.Button(quick_actions, text="Move -Y", command=lambda: self.nudge_selected(0, -1, 0)).pack(fill=tk.X, pady=2)
+        ttk.Button(quick_actions, text="Move +Z", command=lambda: self.nudge_selected(0, 0, 1)).pack(fill=tk.X, pady=2)
+        ttk.Button(quick_actions, text="Move -Z", command=lambda: self.nudge_selected(0, 0, -1)).pack(fill=tk.X, pady=2)
+
+        export_box = ttk.LabelFrame(right, text="Export", padding=8)
+        export_box.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(export_box, text="OBJ", command=lambda: self.export_model("obj")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(export_box, text="STL", command=lambda: self.export_model("stl")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(export_box, text="PLY", command=lambda: self.export_model("ply")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(export_box, text="GLTF", command=lambda: self.export_model("gltf")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        status = ttk.Frame(self.root, padding=(8, 4))
+        status.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(status, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(status, textvariable=self.status_var).pack(anchor="w")
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self.root)
+        self.root.config(menu=menu)
+
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="New", command=self.new_document, accelerator="Ctrl+N")
+        file_menu.add_command(label="Open...", command=self.open_model, accelerator="Ctrl+O")
+        file_menu.add_command(label="Import Models Into Current File...", command=self.import_models_into_current)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save", command=self.save_model, accelerator="Ctrl+S")
+        file_menu.add_command(label="Save As...", command=self.save_model_as, accelerator="Ctrl+Shift+S")
+        file_menu.add_separator()
+        file_menu.add_command(label="Export as JSON...", command=lambda: self.save_as_specific("json"))
+        file_menu.add_command(label="Export as BJSON...", command=lambda: self.save_as_specific("bjson"))
+        file_menu.add_command(label="Export as Text...", command=lambda: self.save_as_specific("text"))
+        file_menu.add_command(label="Export as Blockbench...", command=lambda: self.save_as_specific("bbmodel"))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+        menu.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menu, tearoff=False)
+        edit_menu.add_command(label="Add Cube", command=self.add_cube)
+        edit_menu.add_command(label="Duplicate Selected Cube", command=self.duplicate_selected_cube)
+        edit_menu.add_command(label="Delete Selected Cube", command=self.delete_selected_cube)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Scale All x2", command=lambda: self.scale_all(2.0))
+        edit_menu.add_command(label="Scale All 0.5", command=lambda: self.scale_all(0.5))
+        edit_menu.add_command(label="Center Model", command=self.center_model)
+        menu.add_cascade(label="Edit", menu=edit_menu)
+
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="About", command=self.show_about)
+        help_menu.add_command(label="Text Format Help", command=self.show_text_format_help)
+        menu.add_cascade(label="Help", menu=help_menu)
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Control-n>", lambda _e: self.new_document())
+        self.root.bind("<Control-o>", lambda _e: self.open_model())
+        self.root.bind("<Control-s>", lambda _e: self.save_model())
+        self.root.bind("<Control-S>", lambda _e: self.save_model_as())
+        self.root.bind("<Delete>", lambda _e: self.delete_selected_cube())
+
+    def _add_labeled_entry(self, parent: ttk.Frame, row: int, label: str, var: tk.StringVar, readonly: bool = False) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        entry = ttk.Entry(parent, textvariable=var)
+        if readonly:
+            entry.state(["readonly"])
+        entry.grid(row=row, column=1, sticky="ew", pady=4)
+
+    def set_status(self, text: str) -> None:
+        self.status_var.set(text)
+
+    def clear_filter(self) -> None:
+        self.search_var.set("")
+        self.refresh_cube_tree()
+
+    def focus_inspector(self) -> None:
+        self.root.focus_force()
+
+    def new_document(self) -> None:
+        if not self.confirm_discard_changes():
+            return
+        default_cube = Cuboid(
+            geometry_key="geometry.default",
+            bone_name="root",
+            cube_index=0,
+            name="cube0",
+            origin=np.array([0.0, 0.0, 0.0], dtype=float),
+            size=np.array([8.0, 8.0, 8.0], dtype=float),
+            uuid="new:0",
+        )
+        self.document = ModelDocument(source_type="text", source_path=None, data=None, cuboids=[default_cube], dirty=False, active_model_key="geometry.default", model_keys=["geometry.default"])
+        self.current_index = 0
+        self.refresh_cube_tree(select_index=0)
+        self.redraw_preview()
+        self.load_current_cube_into_form()
+        self.set_status("Created a new model.")
+
+    def open_model(self) -> None:
+        if not self.confirm_discard_changes():
+            return
+        file_path = filedialog.askopenfilename(
+            title="Open model",
+            filetypes=[
+                ("Supported models", "*.txt *.json *.bjson *.bbmodel"),
+                ("Text models", "*.txt"),
+                ("JSON models", "*.json"),
+                ("BJSON models", "*.bjson"),
+                ("Blockbench models", "*.bbmodel"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        try:
+            self.document = self._load_document_from_path(path)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not open the selected file.\n\n{exc}")
+            return
+        self.current_index = 0 if self.document.cuboids else None
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.redraw_preview()
+        self.load_current_cube_into_form()
+        self.set_status(f"Opened: {path.name}")
+
+    def _load_document_from_path(self, path: Path) -> ModelDocument:
+        suffix = path.suffix.lower()
+        if suffix == ".txt":
+            return ModelDocument.from_text(path)
+        if suffix == ".json":
+            return ModelDocument.from_json(path)
+        if suffix == ".bjson":
+            return ModelDocument.from_bjson(path)
+        if suffix == ".bbmodel":
+            return ModelDocument.from_bbmodel(path)
+        raise ValueError("Unsupported file type.")
+
+    def _ensure_geometry_document_for_merge(self) -> None:
+        if self.document.source_type in {"json", "bjson"} and isinstance(self.document.data, dict):
+            return
+
+        raw = _cuboids_to_basic_geometry_json(list(self.document.cuboids))
+        self.document.data = raw
+        self.document.source_type = "json" if self.document.source_type == "text" else "json"
+        self.document.model_keys = [key for key in raw.keys() if isinstance(key, str) and key.startswith("geometry.")]
+        self.document.active_model_key = self.document.active_model_key or (self.document.model_keys[0] if self.document.model_keys else None)
+
+    def import_models_into_current(self) -> None:
+        if not self.document.cuboids and self.document.data is None:
+            messagebox.showwarning(APP_TITLE, "Open or create a target model first.")
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="Import models into current file",
+            filetypes=[
+                ("Supported models", "*.txt *.json *.bjson *.bbmodel"),
+                ("Text models", "*.txt"),
+                ("JSON models", "*.json"),
+                ("BJSON models", "*.bjson"),
+                ("Blockbench models", "*.bbmodel"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        try:
+            imported = self._load_document_from_path(Path(file_path))
+            self._ensure_geometry_document_for_merge()
+            imported_raw = _document_to_geometry_json(imported)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not import models from the selected file.\n\n{exc}")
+            return
+
+        existing_names = set(self.document.model_keys)
+        incoming_names = [key for key in imported_raw.keys() if isinstance(key, str) and key.startswith("geometry.")]
+        collisions = sorted(name for name in incoming_names if name in existing_names)
+        replace_existing = False
+        if collisions:
+            replace_existing = messagebox.askyesno(
+                APP_TITLE,
+                "One or more imported model names already exist in the current file.\n\n"
+                + "Choose Yes to overwrite same-named models.\n"
+                + "Choose No to keep both by importing duplicates with a new name.\n\n"
+                + "Conflicting models:\n"
+                + "\n".join(collisions[:12]),
+            )
+
+        rename_map: dict[str, str] = {}
+        for model_name in incoming_names:
+            final_name = model_name
+            if model_name in existing_names and not replace_existing:
+                final_name = _make_unique_model_name(model_name, existing_names)
+            rename_map[model_name] = final_name
+            existing_names.add(final_name)
+
+        target_raw = self.document._apply_cuboids_to_json() if self.document.data is not None else {}
+
+        for old_name, new_name in rename_map.items():
+            geometry_data = copy.deepcopy(imported_raw.get(old_name, {}))
+            if replace_existing or new_name not in target_raw:
+                target_raw[new_name] = geometry_data
+            else:
+                target_raw[new_name] = geometry_data
+
+        self.document.data = target_raw
+        cuboids, model_keys = ModelDocument._extract_cuboids_from_geometry_json(target_raw)
+        for cube in cuboids:
+            cube.geometry_key = rename_map.get(cube.geometry_key, cube.geometry_key)
+            cube.uuid = f"{cube.geometry_key}|{cube.bone_name}|{cube.cube_index}"
+        self.document.cuboids = cuboids
+        self.document.model_keys = [rename_map.get(key, key) for key in model_keys]
+        self.document.model_keys = list(dict.fromkeys(self.document.model_keys))
+        preferred = self.document.active_model_key
+        if preferred in self.document.model_keys:
+            self.document.active_model_key = preferred
+        elif rename_map:
+            self.document.active_model_key = next(iter(rename_map.values()))
+        elif self.document.model_keys:
+            self.document.active_model_key = self.document.model_keys[0]
+        self.current_index = self.document.visible_cuboids()[0][0] if self.document.visible_cuboids() else None
+        self.mark_dirty()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+        imported_count = len(rename_map)
+        self.set_status(f"Imported {imported_count} model(s) from {Path(file_path).name}.")
+
+    def save_model(self) -> None:
+        if self.document.source_path is None:
+            self.save_model_as()
+            return
+        try:
+            self.document.save_to(self.document.source_path, self.document.source_type)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not save the model.\n\n{exc}")
+            return
+        self.refresh_title()
+        self.set_status(f"Saved: {self.document.source_path.name}")
+
+    def save_model_as(self) -> None:
+        self._save_via_dialog(default_type=self.document.source_type or "text")
+
+    def save_as_specific(self, target_type: str) -> None:
+        self._save_via_dialog(default_type=target_type)
+
+    def _save_via_dialog(self, default_type: str) -> None:
+        filetypes_map = {
+            "text": (("Text models", "*.txt"),),
+            "json": (("JSON models", "*.json"),),
+            "bjson": (("BJSON models", "*.bjson"),),
+            "bbmodel": (("Blockbench models", "*.bbmodel"),),
+        }
+        extension_map = {"text": ".txt", "json": ".json", "bjson": ".bjson", "bbmodel": ".bbmodel"}
+        file_path = filedialog.asksaveasfilename(
+            title="Save model as",
+            defaultextension=extension_map[default_type],
+            filetypes=[*filetypes_map[default_type], ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+        try:
+            self.document.save_to(Path(file_path), default_type)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Could not save the model.\n\n{exc}")
+            return
+        self.refresh_title()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.set_status(f"Saved as {Path(file_path).name}")
+
+    def refresh_title(self) -> None:
+        suffix = " *" if self.document.dirty else ""
+        name = self.document.source_path.name if self.document.source_path else "Untitled"
+        self.root.title(f"{APP_TITLE} v{APP_VERSION} — {name}{suffix}")
+
+    def refresh_cube_tree(self, select_index: Optional[int] = None) -> None:
+        for item in self.cube_tree.get_children():
+            self.cube_tree.delete(item)
+
+        query = self.search_var.get().strip().lower()
+        self.filtered_indices = []
+
+        for idx, cube in self.document.visible_cuboids():
+            hay = f"{cube.name} {cube.bone_name} {cube.geometry_key}".lower()
+            if query and query not in hay:
+                continue
+            self.filtered_indices.append(idx)
+            self.cube_tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    cube.name,
+                    _triple_to_text(cube.origin),
+                    _triple_to_text(cube.size),
+                ),
+            )
+
+        if select_index is not None and str(select_index) in self.cube_tree.get_children():
+            self.cube_tree.selection_set(str(select_index))
+            self.cube_tree.focus(str(select_index))
+            self.cube_tree.see(str(select_index))
+            self.current_index = select_index
+        elif self.current_index is not None and str(self.current_index) in self.cube_tree.get_children():
+            self.cube_tree.selection_set(str(self.current_index))
+        elif self.filtered_indices:
+            self.current_index = self.filtered_indices[0]
+            self.cube_tree.selection_set(str(self.current_index))
+        else:
+            self.current_index = None
+
+        loaded_name = self.document.source_path.name if self.document.source_path else "Untitled"
+        visible_count = len(self.document.visible_cuboids())
+        total_count = len(self.document.cuboids)
+        self.model_info_var.set(f"{loaded_name} • showing {visible_count} / {total_count} cube(s)")
+        self.model_combo["values"] = self.document.model_keys or [""]
+        self.active_model_var.set(self.document.active_model_key or "")
+        self.refresh_title()
+
+    def on_model_change(self, _event: tk.Event | None = None) -> None:
+        selected_model = self.active_model_var.get().strip() or None
+        self.document.set_active_model(selected_model)
+        visible = self.document.visible_cuboids()
+        self.current_index = visible[0][0] if visible else None
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+        if selected_model:
+            self.set_status(f"Switched to model: {selected_model}")
+
+    def on_tree_select(self, _event: tk.Event | None = None) -> None:
+        selected = self.cube_tree.selection()
+        if not selected:
+            return
+        self.current_index = int(selected[0])
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+
+    def current_cube(self) -> Optional[Cuboid]:
+        if self.current_index is None:
+            return None
+        if not (0 <= self.current_index < len(self.document.cuboids)):
+            return None
+        return self.document.cuboids[self.current_index]
+
+    def load_current_cube_into_form(self) -> None:
+        cube = self.current_cube()
+        if cube is None:
+            self.name_var.set("")
+            self.geometry_var.set("")
+            self.bone_var.set("")
+            for var in self.origin_vars + self.size_vars:
+                var.set("")
+            return
+        self.name_var.set(cube.name)
+        self.geometry_var.set(cube.geometry_key)
+        self.bone_var.set(cube.bone_name)
+        for idx in range(3):
+            self.origin_vars[idx].set(_fmt_number(float(cube.origin[idx])))
+            self.size_vars[idx].set(_fmt_number(float(cube.size[idx])))
+
+    def apply_inspector_changes(self) -> None:
+        cube = self.current_cube()
+        if cube is None:
+            messagebox.showwarning(APP_TITLE, "Select a cube first.")
+            return
+        try:
+            new_origin = np.array([float(v.get().strip()) for v in self.origin_vars], dtype=float)
+            new_size = np.array([float(v.get().strip()) for v in self.size_vars], dtype=float)
+        except ValueError:
+            messagebox.showerror(APP_TITLE, "Origin and Size must use valid numbers.")
+            return
+        if np.any(new_size == 0):
+            messagebox.showerror(APP_TITLE, "Cube size values cannot be zero.")
+            return
+
+        cube.name = self.name_var.get().strip() or cube.name
+        cube.origin = new_origin
+        cube.size = new_size
+        self.mark_dirty()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.redraw_preview()
+        self.set_status(f"Updated {cube.name}")
+
+    def mark_dirty(self) -> None:
+        self.document.dirty = True
+        self.refresh_title()
+
+    def add_cube(self) -> None:
+        if self.document.source_type in {"json", "bjson", "bbmodel"} and self.document.data is not None:
+            geometry_key = self.document.active_model_key or (self.document.model_keys[0] if self.document.model_keys else "geometry.default")
+            bone_name = self._choose_bone_for_active_model(geometry_key)
+            if bone_name is None:
+                return
+        else:
+            geometry_key, bone_name = "geometry.default", "root"
+
+        next_index = sum(1 for c in self.document.cuboids if c.geometry_key == geometry_key and c.bone_name == bone_name)
+        new_cube = Cuboid(
+            geometry_key=geometry_key,
+            bone_name=bone_name,
+            cube_index=next_index,
+            name=f"{bone_name}[{next_index}]",
+            origin=np.array([0.0, 0.0, 0.0], dtype=float),
+            size=np.array([4.0, 4.0, 4.0], dtype=float),
+            uuid=f"new:{time.time()}:{next_index}",
+        )
+        self.document.cuboids.append(new_cube)
+        self._reindex_group(geometry_key, bone_name)
+        self.current_index = len(self.document.cuboids) - 1
+        self.mark_dirty()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+        self.set_status("Added a new cube.")
+
+    def duplicate_selected_cube(self) -> None:
+        cube = self.current_cube()
+        if cube is None:
+            messagebox.showwarning(APP_TITLE, "Select a cube first.")
+            return
+        cloned = cube.clone()
+        cloned.origin = cube.origin + np.array([1.0, 1.0, 1.0], dtype=float)
+        cloned.name = f"{cube.bone_name}[copy]"
+        cloned.uuid = f"dup:{time.time()}"
+        self.document.cuboids.append(cloned)
+        self._reindex_group(cloned.geometry_key, cloned.bone_name)
+        self.current_index = self.document.cuboids.index(cloned)
+        self.mark_dirty()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+        self.set_status(f"Duplicated {cube.name}")
+
+    def delete_selected_cube(self) -> None:
+        cube = self.current_cube()
+        if cube is None:
+            return
+        if len(self.document.cuboids) == 1:
+            messagebox.showwarning(APP_TITLE, "You need at least one cube in the model.")
+            return
+        if not messagebox.askyesno(APP_TITLE, f"Delete {cube.name}?"):
+            return
+        geometry_key, bone_name = cube.geometry_key, cube.bone_name
+        del self.document.cuboids[self.current_index]
+        self._reindex_group(geometry_key, bone_name)
+        self.current_index = min(self.current_index, len(self.document.cuboids) - 1)
+        self.mark_dirty()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.load_current_cube_into_form()
+        self.redraw_preview()
+        self.set_status("Cube deleted.")
+
+    def _reindex_group(self, geometry_key: str, bone_name: str) -> None:
+        group = [c for c in self.document.cuboids if c.geometry_key == geometry_key and c.bone_name == bone_name]
+        for idx, cube in enumerate(group):
+            cube.cube_index = idx
+            if "[copy]" not in cube.name:
+                cube.name = f"{bone_name}[{idx}]"
+
+    def nudge_selected(self, dx: float, dy: float, dz: float) -> None:
+        cube = self.current_cube()
+        if cube is None:
+            return
+        cube.origin = cube.origin + np.array([dx, dy, dz], dtype=float)
+        self.mark_dirty()
+        self.load_current_cube_into_form()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.redraw_preview()
+
+    def scale_all(self, factor: float) -> None:
+        visible = self.document.visible_cuboids()
+        if not visible:
+            return
+        for _, cube in visible:
+            cube.origin = cube.origin * factor
+            cube.size = cube.size * factor
+        self.mark_dirty()
+        self.load_current_cube_into_form()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.redraw_preview()
+        self.set_status(f"Scaled entire model by {factor}.")
+
+    def center_model(self) -> None:
+        if not self.document.cuboids:
+            return
+        mins, maxs = self._get_model_bounds()
+        center = (mins + maxs) / 2.0
+        for _, cube in self.document.visible_cuboids():
+            cube.origin = cube.origin - center
+        self.mark_dirty()
+        self.load_current_cube_into_form()
+        self.refresh_cube_tree(select_index=self.current_index)
+        self.redraw_preview()
+        self.set_status("Centered the model around the origin.")
+
+    def _get_model_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        visible = [cube for _, cube in self.document.visible_cuboids()]
+        if not visible:
+            return np.array([-1.0, -1.0, -1.0]), np.array([1.0, 1.0, 1.0])
+        mins = np.min(np.array([c.origin for c in visible]), axis=0)
+        maxs = np.max(np.array([c.origin + c.size for c in visible]), axis=0)
+        return mins, maxs
+
+    def redraw_preview(self) -> None:
+        self.ax.clear()
+        self.ax.set_facecolor("#1f1f1f")
+        self.figure.patch.set_facecolor("#1f1f1f")
+        self.ax.view_init(self.camera_elev, self.camera_azim)
+
+        selected = self.current_cube()
+        for idx, cube in self.document.visible_cuboids():
+            corners = cube.corners()
+            faces = [
                 [corners[0], corners[1], corners[2], corners[3]],
                 [corners[4], corners[5], corners[6], corners[7]],
+                [corners[0], corners[1], corners[5], corners[4]],
+                [corners[2], corners[3], corners[7], corners[6]],
+                [corners[0], corners[3], corners[7], corners[4]],
+                [corners[1], corners[2], corners[6], corners[5]],
             ]
-        
-            preview_ax.add_collection3d(Poly3DCollection(verts, facecolors='cyan', 
-                                                   linewidths=1, edgecolors='red', alpha=0.15))
-        
-            if global_preview_rotation:
-                rotation_angle = (rotation_angle + 2) % 360
+            is_selected = selected is not None and idx == self.current_index
+            poly = Poly3DCollection(
+                faces,
+                facecolors=("#49b6ff" if is_selected else "#62d0c7"),
+                edgecolors="#ff9090",
+                linewidths=0.8,
+                alpha=(0.45 if is_selected else 0.18),
+            )
+            self.ax.add_collection3d(poly)
+            label_pos = cube.origin + (cube.size / 2.0)
+            self.ax.text(label_pos[0], label_pos[1], label_pos[2], cube.name, color=("white" if is_selected else "#d9d9d9"), fontsize=8)
 
-            preview_ax.view_init(elev=30, azim=rotation_angle)
-            max_dim = max(current_size)
-            center = np.array(current_pos) + np.array(current_size) / 2
-            margin = max_dim * 0.5
-            preview_ax.set_xlim(center[0] - max_dim - margin, center[0] + max_dim + margin)
-            preview_ax.set_ylim(center[1] - max_dim - margin, center[1] + max_dim + margin)
-            preview_ax.set_zlim(center[2] - max_dim - margin, center[2] + max_dim + margin)
-            preview_canvas.draw()
-            animation_id = dialog.after(50, update_preview)
-        
-        except ValueError:
-            animation_id = dialog.after(50, update_preview)
+        mins, maxs = self._get_model_bounds()
+        max_range = float(np.max(maxs - mins))
+        if max_range <= 0:
+            max_range = 1.0
+        max_range *= self.zoom_scale
+        mid = (mins + maxs) / 2.0
+        half = max_range / 2.0
+        self.ax.set_xlim(mid[0] - half, mid[0] + half)
+        self.ax.set_ylim(mid[1] - half, mid[1] + half)
+        self.ax.set_zlim(mid[2] - half, mid[2] + half)
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.set_zlabel("Z")
+        self.ax.grid(True, alpha=0.2)
+        self.canvas.draw_idle()
 
-    tk.Label(left_frame, text="Block Type:").pack(pady=5)
-    block_type = ttk.Combobox(left_frame, values=sorted(list(base_names)), state="readonly")
-    block_type.set(sorted(list(base_names))[0])
-    block_type.pack(pady=5)
-    name_order_frame = ttk.LabelFrame(left_frame)
-    name_order_frame.pack(pady=5)
-    name_order_var = tk.BooleanVar(value=True)
-    name_order_check = ttk.Checkbutton(
-        name_order_frame, 
-        text="Make Seperate Body Part", 
-        variable=name_order_var
-    )
-    name_order_check.pack()
+    def reset_view(self) -> None:
+        self.camera_azim = 35
+        self.camera_elev = 25
+        self.zoom_scale = 1.0
+        self.redraw_preview()
+        self.set_status("View reset.")
 
-    def on_value_change(*args):
-        if animation_id:
-            dialog.after_cancel(animation_id)
-        update_preview()
+    def on_scroll_plot(self, event: Any) -> None:
+        if getattr(event, "button", None) == "up":
+            self.zoom_scale = max(0.1, self.zoom_scale * 0.9)
+        else:
+            self.zoom_scale = min(10.0, self.zoom_scale * 1.1)
+        self.redraw_preview()
 
-    pos_frame = ttk.LabelFrame(left_frame, text="Position")
-    pos_frame.pack(pady=10, padx=10, fill="x")
-    pos_x = tk.StringVar(value="0")
-    pos_y = tk.StringVar(value="0")
-    pos_z = tk.StringVar(value="0")
-    pos_x.trace_add("write", on_value_change)
-    pos_y.trace_add("write", on_value_change)
-    pos_z.trace_add("write", on_value_change)
-    tk.Label(pos_frame, text="X:").grid(row=0, column=0, padx=5, pady=5)
-    tk.Entry(pos_frame, textvariable=pos_x, width=10).grid(row=0, column=1, padx=5, pady=5)
-    tk.Label(pos_frame, text="Y:").grid(row=0, column=2, padx=5, pady=5)
-    tk.Entry(pos_frame, textvariable=pos_y, width=10).grid(row=0, column=3, padx=5, pady=5)
-    tk.Label(pos_frame, text="Z:").grid(row=0, column=4, padx=5, pady=5)
-    tk.Entry(pos_frame, textvariable=pos_z, width=10).grid(row=0, column=5, padx=5, pady=5)
-    size_frame = ttk.LabelFrame(left_frame, text="Size")
-    size_frame.pack(pady=10, padx=10, fill="x")
-    size_x = tk.StringVar(value="3")
-    size_y = tk.StringVar(value="3")
-    size_z = tk.StringVar(value="3")
-    size_x.trace_add("write", on_value_change)
-    size_y.trace_add("write", on_value_change)
-    size_z.trace_add("write", on_value_change)
-    tk.Label(size_frame, text="X:").grid(row=0, column=0, padx=5, pady=5)
-    tk.Entry(size_frame, textvariable=size_x, width=10).grid(row=0, column=1, padx=5, pady=5)
-    tk.Label(size_frame, text="Y:").grid(row=0, column=2, padx=5, pady=5)
-    tk.Entry(size_frame, textvariable=size_y, width=10).grid(row=0, column=3, padx=5, pady=5)
-    tk.Label(size_frame, text="Z:").grid(row=0, column=4, padx=5, pady=5)
-    tk.Entry(size_frame, textvariable=size_z, width=10).grid(row=0, column=5, padx=5, pady=5)
-    def validate_and_create():
-        try:
-            pos = [float(pos_x.get()), float(pos_y.get()), float(pos_z.get())]
-            size = [float(size_x.get()), float(size_y.get()), float(size_z.get())]
-            base_name = block_type.get()
-            counter = 0
-            if not name_order_var.get():
-                new_name = f"{counter}{base_name}"
-                while new_name in existing_names:
-                    counter += 1
-                    new_name = f"{counter}{base_name}"
-            else:
-                new_name = f"{base_name}{counter}"
-                while new_name in existing_names:
-                    counter += 1
-                    new_name = f"{base_name}{counter}"
+    def on_drag_start(self, event: tk.Event) -> None:
+        self.drag_last_xy = (event.x, event.y)
 
-            with open(current_model_file, 'r') as file:
-                content = file.read()
-                
-            if content and not content.endswith('\n\n'):
-                if content.endswith('\n'):
-                    prefix = '\n'
-                else:
-                    prefix = '\n\n'
-            else:
-                prefix = ''
-                
-            new_block = [
-                f"{prefix}{new_name}\n",
-                f"{pos[0]}, {pos[1]}, {pos[2]}\n",
-                f"{size[0]}, {size[1]}, {size[2]}\n\n"
-            ]
-
-            with open(current_model_file, 'a') as file:
-                file.writelines(new_block)
-
-            global objects
-            objects = read_objects_from_file(current_model_file)
-            object_selector.config(values=[obj.name for obj in objects])
-            draw_3d_plot(objects, canvas)
-            if animation_id:
-                dialog.after_cancel(animation_id)
-
-            dialog.destroy()
-
-        except ValueError:
-            messagebox.showerror("Error", "Invalid input values. Please enter valid numbers.")
-
-    def on_dialog_close():
-        if animation_id:
-            dialog.after_cancel(animation_id)
-        dialog.destroy()
-
-    button_frame = ttk.Frame(left_frame)
-    button_frame.pack(pady=20)
-    ttk.Button(button_frame, text="Create", command=validate_and_create).pack(side=tk.LEFT, padx=10)
-    ttk.Button(button_frame, text="Cancel", command=on_dialog_close).pack(side=tk.LEFT, padx=10)
-    try:
-        last_values['pos'] = [float(pos_x.get()), float(pos_y.get()), float(pos_z.get())]
-        last_values['size'] = [float(size_x.get()), float(size_y.get()), float(size_z.get())]
-    except ValueError:
-        last_values['pos'] = [0, 0, 0]
-        last_values['size'] = [3, 3, 3]
-
-    update_preview()
-    dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
-
-def remove_block():
-    global objects
-    if not objects:
-        messagebox.showerror("Error", "No objects available to remove.")
-        return
-
-    dialog = tk.Toplevel()
-    dialog.title("Remove Block")
-    dialog.geometry("300x150")
-    dialog.resizable(False, False)
-    dialog.transient()
-    dialog.grab_set()
-    tk.Label(dialog, text="Select Block to Remove:").pack(pady=10)
-    block_selector = ttk.Combobox(dialog, values=[obj.name for obj in objects], state="readonly")
-    block_selector.pack(pady=5)
-
-    def confirm_removal():
-        selected_name = block_selector.get()
-        if not selected_name:
-            messagebox.showerror("Error", "Please select a block to remove.")
+    def on_drag_motion(self, event: tk.Event) -> None:
+        if self.drag_last_xy is None:
             return
-        
-        if not messagebox.askyesno("Confirm Deletion", f"Are you sure you want to remove '{selected_name}'?"):
+        last_x, last_y = self.drag_last_xy
+        self.camera_azim += (event.x - last_x) * 0.5
+        self.camera_elev -= (event.y - last_y) * 0.5
+        self.drag_last_xy = (event.x, event.y)
+        self.redraw_preview()
+
+    def on_drag_end(self, _event: tk.Event) -> None:
+        self.drag_last_xy = None
+
+    def export_model(self, kind: str) -> None:
+        if not self.document.visible_cuboids():
+            messagebox.showwarning(APP_TITLE, "There is no visible model to export.")
             return
-
         try:
-            with open(current_model_file, 'r') as file:
-                lines = file.readlines()
+            if kind == "obj":
+                self.export_obj()
+            elif kind == "stl":
+                self.export_stl()
+            elif kind == "ply":
+                self.export_ply()
+            elif kind == "gltf":
+                self.export_gltf()
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Export failed.\n\n{exc}")
 
-            new_lines = []
-            i = 0
-            while i < len(lines):
-                if lines[i].strip() == selected_name:
-                    i += 4
-                else:
-                    new_lines.append(lines[i])
-                    i += 1
+    def export_obj(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".obj", filetypes=[("OBJ files", "*.obj")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Exported by MC3DS Model Editor Plus\n")
+            vertex_offset = 1
+            for _, cube in self.document.visible_cuboids():
+                vertices = cube.corners()
+                f.write(f"o {cube.name}\n")
+                for v in vertices:
+                    f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+                faces = [
+                    (0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+                    (2, 3, 7, 6), (0, 3, 7, 4), (1, 2, 6, 5),
+                ]
+                for face in faces:
+                    a, b, c, d = [vertex_offset + idx for idx in face]
+                    f.write(f"f {a} {b} {c} {d}\n")
+                vertex_offset += 8
+        self.set_status(f"Exported OBJ: {Path(path).name}")
 
-            with open(current_model_file, 'w') as file:
-                file.writelines(new_lines)
+    def export_stl(self) -> None:
+        if stl is None:
+            raise RuntimeError("numpy-stl is not installed, so STL export is unavailable.")
+        path = filedialog.asksaveasfilename(defaultextension=".stl", filetypes=[("STL files", "*.stl")])
+        if not path:
+            return
+        triangles: list[np.ndarray] = []
+        for _, cube in self.document.visible_cuboids():
+            v = np.array(cube.corners(), dtype=float)
+            triangles.extend([
+                np.array([v[0], v[1], v[2]]), np.array([v[0], v[2], v[3]]),
+                np.array([v[4], v[5], v[6]]), np.array([v[4], v[6], v[7]]),
+                np.array([v[0], v[1], v[5]]), np.array([v[0], v[5], v[4]]),
+                np.array([v[2], v[3], v[7]]), np.array([v[2], v[7], v[6]]),
+                np.array([v[0], v[3], v[7]]), np.array([v[0], v[7], v[4]]),
+                np.array([v[1], v[2], v[6]]), np.array([v[1], v[6], v[5]]),
+            ])
+        mesh = stl.mesh.Mesh(np.zeros(len(triangles), dtype=stl.mesh.Mesh.dtype))
+        for i, tri in enumerate(triangles):
+            mesh.vectors[i] = tri
+        mesh.save(path)
+        self.set_status(f"Exported STL: {Path(path).name}")
 
-            global objects
-            objects = read_objects_from_file(current_model_file)
-            object_selector.config(values=[obj.name for obj in objects])
-            object_selector.set('')
-            draw_3d_plot(objects, canvas)
-            messagebox.showinfo("Success", f"Block '{selected_name}' has been removed.")
-            dialog.destroy()
+    def export_ply(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".ply", filetypes=[("PLY files", "*.ply")])
+        if not path:
+            return
+        vertices: list[tuple[float, float, float]] = []
+        faces: list[tuple[int, int, int, int]] = []
+        for _, cube in self.document.visible_cuboids():
+            start = len(vertices)
+            verts = [tuple(v) for v in cube.corners()]
+            vertices.extend(verts)
+            faces.extend([
+                (start + 0, start + 1, start + 2, start + 3),
+                (start + 4, start + 5, start + 6, start + 7),
+                (start + 0, start + 1, start + 5, start + 4),
+                (start + 2, start + 3, start + 7, start + 6),
+                (start + 0, start + 3, start + 7, start + 4),
+                (start + 1, start + 2, start + 6, start + 5),
+            ])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {len(vertices)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write(f"element face {len(faces)}\n")
+            f.write("property list uchar int vertex_indices\nend_header\n")
+            for v in vertices:
+                f.write(f"{v[0]} {v[1]} {v[2]}\n")
+            for face in faces:
+                f.write(f"4 {face[0]} {face[1]} {face[2]} {face[3]}\n")
+        self.set_status(f"Exported PLY: {Path(path).name}")
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to remove block: {str(e)}")
+    def export_gltf(self) -> None:
+        if GLTF2 is None:
+            raise RuntimeError("pygltflib is not installed, so GLTF export is unavailable.")
+        path = filedialog.asksaveasfilename(defaultextension=".gltf", filetypes=[("GLTF files", "*.gltf")])
+        if not path:
+            return
+        vertices: list[float] = []
+        indices: list[int] = []
+        vertex_offset = 0
+        face_indices = [
+            (0, 1, 2), (0, 2, 3),
+            (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4),
+            (2, 3, 7), (2, 7, 6),
+            (0, 3, 7), (0, 7, 4),
+            (1, 2, 6), (1, 6, 5),
+        ]
+        for _, cube in self.document.visible_cuboids():
+            cube_vertices = cube.corners()
+            for v in cube_vertices:
+                vertices.extend(v)
+            for tri in face_indices:
+                indices.extend([vertex_offset + tri[0], vertex_offset + tri[1], vertex_offset + tri[2]])
+            vertex_offset += 8
 
-    button_frame = ttk.Frame(dialog)
-    button_frame.pack(pady=20, fill="x")
-    tk.Button(button_frame, text="Remove", command=confirm_removal).pack(side="left", padx=10, expand=True)
-    tk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=10, expand=True)
-    dialog.wait_window()
+        vertices_bytes = struct.pack(f"{len(vertices)}f", *vertices)
+        indices_bytes = struct.pack(f"{len(indices)}I", *indices)
+        blob = vertices_bytes + indices_bytes
 
-def main():
-    global root, ax, canvas, objects, object_selector, pos_entry_x, pos_entry_y, pos_entry_z, dim_entry_x, dim_entry_y, dim_entry_z, model_selector
-    global current_model_file
+        gltf = GLTF2()
+        gltf.scenes = [Scene(nodes=[0])]
+        gltf.scene = 0
+        gltf.nodes = [Node(mesh=0)]
+        gltf.meshes = [Mesh(primitives=[Primitive(attributes={"POSITION": 0}, indices=1)])]
+        gltf.buffers = [Buffer(byteLength=len(blob), uri="data:application/octet-stream;base64," + base64.b64encode(blob).decode("ascii"))]
+        gltf.bufferViews = [
+            BufferView(buffer=0, byteOffset=0, byteLength=len(vertices_bytes), target=34962),
+            BufferView(buffer=0, byteOffset=len(vertices_bytes), byteLength=len(indices_bytes), target=34963),
+        ]
+        gltf.accessors = [
+            Accessor(bufferView=0, byteOffset=0, componentType=5126, count=len(vertices) // 3, type="VEC3"),
+            Accessor(bufferView=1, byteOffset=0, componentType=5125, count=len(indices), type="SCALAR"),
+        ]
+        gltf.save(path)
+        self.set_status(f"Exported GLTF: {Path(path).name}")
+
+    def _choose_bone_for_active_model(self, geometry_key: str) -> Optional[str]:
+        if self.document.source_type == "bbmodel":
+            existing = sorted({cube.bone_name for _, cube in self.document.visible_cuboids()})
+            options = existing or ["root"]
+            prompt = "Enter the target group/bone name for the new Blockbench cube:\n\n" + "\n".join(options[:20])
+            selection = simpledialog.askstring(APP_TITLE, prompt, initialvalue=(options[0] if options else "root"))
+            return selection.strip() if selection else None
+
+        options: list[str] = []
+        if self.document.data:
+            geometry_data = self.document.data.get(geometry_key, {})
+            if isinstance(geometry_data, dict):
+                bones = geometry_data.get("bones", [])
+                if isinstance(bones, list):
+                    for bone in bones:
+                        if isinstance(bone, dict):
+                            options.append(str(bone.get("name", "bone")))
+        options = sorted(set(options))
+        if not options:
+            return "root"
+        prompt = "Enter the exact bone name for the active model:\n\n" + "\n".join(options[:20])
+        selection = simpledialog.askstring(APP_TITLE, prompt, initialvalue=options[0])
+        if not selection:
+            return None
+        if selection.strip() in options:
+            return selection.strip()
+        messagebox.showerror(APP_TITLE, "That bone name did not match one of the available bones.")
+        return None
+
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            APP_TITLE,
+            f"{APP_TITLE} v{APP_VERSION} - Cracko298\n\n"
+            "• Better UI/UX.\n"
+            "• Safer Save System.\n"
+            "• Search & Duplication.\n"
+            "• Selectable Models & Filters.\n"
+            "• Blockbench (.bbmodel) Support.\n"
+            "• Model importing/merging into JSON/BJSON.\n"
+            "• Easier exporting into Standard Model Formats.",
+        )
+
+    def show_text_format_help(self) -> None:
+        messagebox.showinfo(APP_TITLE, f"Text model format:\n\n{TEXT_FORMAT_HINT}")
+
+    def confirm_discard_changes(self) -> bool:
+        if not self.document.dirty:
+            return True
+        return messagebox.askyesno(APP_TITLE, "You have unsaved changes. Continue and discard them?")
+
+    def on_close(self) -> None:
+        if not self.confirm_discard_changes():
+            return
+        self.root.destroy()
+
+
+def _document_to_geometry_json(document: ModelDocument) -> dict[str, Any]:
+    if document.source_type in {"json", "bjson"} and isinstance(document.data, dict):
+        return document._apply_cuboids_to_json()
+
+    grouped: dict[str, list[Cuboid]] = {}
+    for cube in document.cuboids:
+        grouped.setdefault(cube.geometry_key or "geometry.default", []).append(cube)
+
+    normalized: list[Cuboid] = []
+    for geometry_key, cubes in grouped.items():
+        if not str(geometry_key).startswith("geometry."):
+            geometry_key = f"geometry.{geometry_key}"
+        bone_counts: dict[str, int] = {}
+        for cube in cubes:
+            bone_name = cube.bone_name or "root"
+            cube_index = bone_counts.get(bone_name, 0)
+            bone_counts[bone_name] = cube_index + 1
+            normalized.append(
+                Cuboid(
+                    geometry_key=geometry_key,
+                    bone_name=bone_name,
+                    cube_index=cube_index,
+                    name=cube.name,
+                    origin=cube.origin.copy(),
+                    size=cube.size.copy(),
+                    uuid=cube.uuid,
+                )
+            )
+    return _cuboids_to_basic_geometry_json(normalized)
+
+
+def _make_unique_model_name(base_name: str, existing_names: set[str]) -> str:
+    if base_name not in existing_names:
+        return base_name
+    stem = base_name
+    counter = 2
+    while True:
+        candidate = f"{stem}_{counter}"
+        if candidate not in existing_names:
+            return candidate
+        counter += 1
+
+
+def _round_trip_list(values: np.ndarray) -> list[int | float]:
+    out: list[int | float] = []
+    for value in values.tolist():
+        value = float(value)
+        out.append(int(value) if value.is_integer() else value)
+    return out
+
+
+def _cuboids_to_basic_geometry_json(cuboids: list[Cuboid]) -> dict[str, Any]:
+    grouped: dict[tuple[str, str], list[Cuboid]] = {}
+    for cube in cuboids:
+        grouped.setdefault((cube.geometry_key, cube.bone_name), []).append(cube)
+
+    geometry_map: dict[str, dict[str, Any]] = {}
+    for (geometry_key, bone_name), cubes in grouped.items():
+        geometry = geometry_map.setdefault(geometry_key, {"bones": []})
+        geometry["bones"].append(
+            {
+                "name": bone_name,
+                "pivot": [0, 0, 0],
+                "cubes": [{"origin": _round_trip_list(c.origin), "size": _round_trip_list(c.size)} for c in cubes],
+            }
+        )
+    return geometry_map or {"geometry.default": {"bones": []}}
+
+
+def _cuboids_to_basic_bbmodel(cuboids: list[Cuboid], active_model_key: Optional[str]) -> dict[str, Any]:
+    identifier = (active_model_key or "geometry.blockbench_model").removeprefix("geometry.")
+    return {
+        "meta": {"format_version": "4.0"},
+        "name": identifier,
+        "model_identifier": identifier,
+        "resolution": {"width": 64, "height": 64},
+        "elements": [
+            {
+                "name": cube.name,
+                "from": _round_trip_list(cube.origin),
+                "to": _round_trip_list(cube.origin + cube.size),
+                "uuid": cube.uuid or f"bb:{idx}",
+                **({"__group": cube.bone_name} if cube.bone_name != "root" else {}),
+            }
+            for idx, cube in enumerate(cuboids)
+        ],
+    }
+
+
+def _fmt_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _triple_to_text(values: np.ndarray) -> str:
+    return ", ".join(_fmt_number(float(v)) for v in values.tolist())
+
+
+def main() -> None:
     root = tk.Tk()
-    root.title("BJSON Model Editor")
-    root.protocol("WM_DELETE_WINDOW", quit_app)
-    if os.path.exists('.\\data') == False:
-        bjson2models()
-
-    menu_bar = tk.Menu(root)
-    root.config(menu=menu_bar)
-    file_menu = tk.Menu(menu_bar, tearoff=0)
-    menu_bar.add_cascade(label="File", menu=file_menu)
-    open_menu = tk.Menu(file_menu, tearoff=0)
-    file_menu.add_cascade(label="Open", menu=open_menu)
-    open_menu.add_command(label="Open Text Model", command=open_file)
-    open_menu.add_command(label="Open JSON Model", command=openJsonFile)
-    open_menu.add_command(label="Open BJSON Model", command=openBjsonFile)
-    open_menu.add_command(label="Open 3DS World Folder", command=openCDBFile)
-    open_menu.add_command(label="Open BlockBench Model", command=importBBmodel)
-    save_menu = tk.Menu(file_menu, tearoff=0)
-    file_menu.add_cascade(label="Save", menu=save_menu)
-    save_menu.add_command(label="Save Text Model", command=save_file)
-    save_menu.add_command(label="Save JSON Model", command=savetojson)
-    save_menu.add_command(label="Save BJSON Model", command=savetobjson)
-    file_menu.add_separator()
-    file_menu.add_command(label="Exit", command=quit_app)
-
-    # Tools menu
-    tools_menu = tk.Menu(menu_bar, tearoff=0)
-    menu_bar.add_cascade(label="Tools", menu=tools_menu)
-    scaling_menu = tk.Menu(tools_menu, tearoff=0)
-    export_menu = tk.Menu(tools_menu, tearoff=0)
-    export_menu.add_command(label="Export as OBJ", command=export_as_obj)
-    export_menu.add_command(label="Export as STL", command=export_as_stl)
-    export_menu.add_command(label="Export as PLY", command=export_as_ply)
-    export_menu.add_command(label="Export as DAE", command=export_as_dae)
-    export_menu.add_command(label="Export as GLTF", command=export_as_gltf)
-    export_menu.add_command(label="Export as JSON", command=data2json)
-    export_menu.add_command(label="Export as Text", command=export_as_text)
-    tools_menu.add_cascade(label="Export as Model", menu=export_menu)
-    tools_menu.add_cascade(label="Scaling", menu=scaling_menu)
-    scaling_menu.add_command(label="Scale Up (2.0x)", command=lambda: scale_model(2))
-    scaling_menu.add_command(label="Scale Down (0.5x)", command=lambda: scale_model(0.5))
-    tools_menu.add_separator()
-    tools_menu.add_command(label="Map Texture", command=map_texture)
-    tools_menu.add_command(label="Add New Block", command=add_new_block)
-    tools_menu.add_command(label="Remove Block", command=remove_block)
-
-    # Options menu
-    options_menu = tk.Menu(menu_bar, tearoff=0)
-    menu_bar.add_cascade(label="Options", menu=options_menu)
-    options_menu.add_command(label="Set Mouse Speed", command=set_drag_speed)
-    options_menu.add_command(label="Set Zoom Speed", command=set_zoom_speed)
-    options_menu.add_command(label="Set Arrow/WASD Speed", command=set_wasd_speed)
-    preview_rotation_var = tk.BooleanVar(value=True)
-    options_menu.add_checkbutton(label="Preview Rotation", 
-                            variable=preview_rotation_var,
-                            command=toggle_preview_rotation)
-    options_menu.add_separator()
-    options_menu.add_command(label="Update Application", command=updateApplication)
-    about_menu = tk.Menu(menu_bar, tearoff=0)
-    menu_bar.add_cascade(label="About", menu=about_menu)
-    about_menu.add_command(label="About", command=basicAboutDiag)
-    about_menu.add_command(label="Contact", command=contactsDiag)
-    about_menu.add_command(label="License", command=licsenseDiag)
-    model_directory = os.path.join(os.getcwd(), 'data')
-    model_files = list_model_files(model_directory)
-
-    if not model_files:
-        messagebox.showerror("No Models Found", "No .txt model files found in the 'data' directory.")
-        sys.exit()
-
-    current_model_file = os.path.join(model_directory, model_files[0])
-    objects = read_objects_from_file(current_model_file)
-    fig = plt.figure(figsize=(8, 6))
-    fig.patch.set_facecolor('darkgray')
-    ax = fig.add_subplot(111, projection='3d')
-    canvas = FigureCanvasTkAgg(fig, master=root)
-    canvas.mpl_connect('key_press_event', movementWASD)
-    canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    canvas.get_tk_widget().bind("<MouseWheel>", zoom)
-    canvas.get_tk_widget().bind("<ButtonPress-1>", on_press)
-    canvas.get_tk_widget().bind("<B1-Motion>", on_motion)
-    canvas.get_tk_widget().bind("<ButtonRelease-1>", on_release)
-    canvas.get_tk_widget().bind("<MouseWheel>", zoom)
-    draw_3d_plot(objects, canvas)
-    control_panel = tk.Frame(root)
-    control_panel.pack(side=tk.RIGHT, fill=tk.Y)
-
-    # Model selector
-    model_selector_label = tk.Label(control_panel, text="Select Model:")
-    model_selector_label.pack(pady=5)
-    model_selector = ttk.Combobox(control_panel, values=model_files, state='readonly')
-    model_selector.pack(pady=5, padx=10)
-    model_selector.bind("<Key>", disable_keyboard)
-    model_selector.bind("<<ComboboxSelected>>", on_model_selected)
-
-    # Object selector
-    object_selector_label = tk.Label(control_panel, text="Select Object:")
-    object_selector_label.pack(pady=5)
-    object_selector = ttk.Combobox(control_panel, state='readonly')
-    object_selector.pack(pady=5)
-    object_selector.bind("<Key>", disable_keyboard)
-    object_selector.bind("<<ComboboxSelected>>", on_object_selected)
-    pos_label = tk.Label(control_panel, text="Position (x, y, z):")
-    pos_label.pack(pady=5)
-    pos_frame = tk.Frame(control_panel)
-    pos_frame.pack(pady=5)
-    pos_frame.bind("<Key>", disable_keyboard)
-    pos_entry_x = tk.Entry(pos_frame, width=5)
-    pos_entry_x.pack(side=tk.LEFT)
-    pos_entry_y = tk.Entry(pos_frame, width=5)
-    pos_entry_y.pack(side=tk.LEFT)
-    pos_entry_z = tk.Entry(pos_frame, width=5)
-    pos_entry_z.pack(side=tk.LEFT)
-    dim_label = tk.Label(control_panel, text="Dimensions (dx, dy, dz):")
-    dim_label.pack(pady=5)
-    dim_frame = tk.Frame(control_panel)
-    dim_frame.pack(pady=5)
-    dim_entry_x = tk.Entry(dim_frame, width=5)
-    dim_entry_x.pack(side=tk.LEFT)
-    dim_entry_y = tk.Entry(dim_frame, width=5)
-    dim_entry_y.pack(side=tk.LEFT)
-    dim_entry_z = tk.Entry(dim_frame, width=5)
-    dim_entry_z.pack(side=tk.LEFT)
-    update_button = tk.Button(control_panel, text="Update Text Model", command=update_object_data)
-    update_button.pack(pady=10)
-    model_selector.config(width=20)
-    object_selector.config(width=15)
+    app = ModelEditorApp(root)
+    app.refresh_title()
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
