@@ -1,11 +1,8 @@
-# MC3DS-Model-Editor
-
-## (Formerly) MC3DS-BJSON-Model-Editor
-### MC3DS-ME
+## MC3DS-Model-Editor
 - Edit Minecraft 3DS Edition Models in 3D using this GUI.
 
 ## Download:
-- You can download the Application [Here](https://github.com/Cracko298/MC3DS-3D-Model-Editor/releases/download/0.7/mc3ds-model-editor.zip).
+- You can download the Application [Here](https://github.com/Cracko298/MC3DS-3D-Model-Editor/releases/download/1.0/mc3ds-model-editor.zip).
 
 
 ## Features:
